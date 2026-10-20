@@ -25,7 +25,7 @@ You describe the application as managed resources, background processes, and
 hooks. `Run` initializes them, supervises them concurrently, and shuts them all
 down gracefully on the first failure, on a signal, or when the context is
 canceled. On top of that runtime, the library ships the servers (HTTP, gRPC,
-NATS) as managed resources, each populated by your own handlers.
+NATS, UDP) as managed resources, each populated by your own handlers.
 
 ## Why athanor?
 
@@ -45,8 +45,9 @@ happen — which is exactly what this library does for your processes.
 - Before and after hooks, and custom processes managed alongside the resources.
 - Unified lifecycle management for the technical resources your app depends on:
   initialization, observable health statuses, rollback, and failure-driven shutdown.
-- HTTP, gRPC, and NATS servers that are managed resources, each populated by
-  pluggable handlers.
+- HTTP, gRPC, NATS, and UDP servers that are managed resources, each populated
+  by pluggable handlers. The UDP server receives plain or multicast datagrams
+  and watches over the silence of its source.
 - A standalone runner (`resource.Run`) for the programs made of a single
   resource, such as one server.
 - A ready-made `HealthHandler` for every server, reporting the health of your
@@ -66,7 +67,8 @@ The library requires Go 1.21 or later.
 
 The library is split into small packages named after their concept. Several of
 them are named after a protocol (`http`, `grpc`, `nats`), so the examples in
-this README import them under explicit aliases:
+this README import them under explicit aliases. The `udp` package clashes with
+nothing and keeps its name:
 
 ```go
 import (
@@ -76,6 +78,7 @@ import (
 	grpcserver "github.com/grandper/go-athanor/resource/server/grpc"
 	httpserver "github.com/grandper/go-athanor/resource/server/http"
 	natsserver "github.com/grandper/go-athanor/resource/server/nats"
+	"github.com/grandper/go-athanor/resource/server/udp"
 )
 ```
 
@@ -87,6 +90,7 @@ import (
 | `resource/server/http` | The HTTP server resource, its handlers, and its response helpers. |
 | `resource/server/grpc` | The gRPC server resource, its health handler, and its error response helper. |
 | `resource/server/nats` | The NATS server resource, its health handler, and its response helpers. |
+| `resource/server/udp` | The UDP server resource receiving plain or multicast datagrams, and its handler contract. |
 
 ## Quick start
 
@@ -427,7 +431,7 @@ if err := resources.Manage(ctx); err != nil {
 When a single resource is your whole program, you do not need `app.Run`.
 `resource.Run` initializes the resource, blocks until the context is canceled
 or the resource reports `StatusFailed`, then shuts it down with a
-[cleanup context](#cleanup-contexts). It works with the three servers and with
+[cleanup context](#cleanup-contexts). It works with the four servers and with
 any `Managed` of your own:
 
 ```go
@@ -531,7 +535,7 @@ a graceful shutdown.
 #### A server starts once
 
 A server is a single-use value: it goes through `Init` and `Shutdown` once, and
-that is by design. The three servers (HTTP, gRPC, NATS) follow the same rule:
+that is by design. The four servers (HTTP, gRPC, NATS, UDP) follow the same rule:
 
 - Calling `Init` on a running server fails with `ErrServerAlreadyStarted` and
   leaves the running server untouched.
@@ -630,9 +634,10 @@ type Handler interface {
 }
 ```
 
-The three servers share that shape: `Register` returns an error, and a handler
-that cannot register makes `Init` fail with that error, wrapped in
-`failed to register an HTTP handler`.
+The HTTP, gRPC, and NATS servers share that shape: `Register` returns an
+error, and a handler that cannot register makes `Init` fail with that error,
+wrapped in `failed to register an HTTP handler`. The UDP server has nothing to
+register, so its handler [receives the datagrams instead](#writing-a-handler-3).
 
 ```go
 type HelloHandler struct{}
@@ -1075,6 +1080,264 @@ err := resource.Run(ctx, natsserver.NewServer(nc, orderHandler))
 You can also drive a `Server` by hand: register subscriptions with `HandleFunc`,
 subscribe them without blocking with `ListenAndServe`, and cancel them with
 `Close`.
+
+## The UDP server
+
+The `resource/server/udp` package receives datagrams the way the other servers
+receive requests: a `Server` reads a UDP socket, plain or joined to a multicast
+group, and hands every datagram over to your handler. It is a managed resource
+too, and it is the one server of the library that watches its own input: a
+source that goes silent fails the server, so your application stops instead of
+waiting for data that no longer comes.
+
+### The UDP server as a managed resource
+
+`NewServer` builds the server from a `Config` and the one handler consuming the
+datagrams. The resulting `Server` implements `resource.Managed`, so you register
+it on `app.Run` or on a `resource.List` like any other resource:
+
+```go
+config := &udp.Config{
+	Address:         "239.1.1.1:5555",
+	Multicast:       true,
+	InterfaceName:   "eth0",
+	BufferSize:      1500,
+	ReceivedTimeout: 5 * time.Second,
+}
+
+err := app.Run(ctx,
+	app.WithResource(natsResource),                          // initialized first
+	app.WithResource(udp.NewServer(config, receiver)), // the handler publishes to NATS
+	app.WithProcess(process.ListenToSignals),
+)
+```
+
+`Init` checks the configuration, opens the socket synchronously (so an
+occupied port, an unknown interface, or an address that is not a multicast
+group fails initialization immediately), and reads the socket in the
+background. `Shutdown` closes the socket and waits for the handler to return,
+within the context's deadline. The status moves from `StatusInitializing` to
+`StatusHealthy` once the socket is bound, to `StatusFailed` when a read fails
+or the source goes silent, and to `StatusClosed` after a graceful shutdown.
+
+Resources shut down in reverse order of registration, so register the UDP
+server after the resources its handler depends on: the inbound data stops
+first, then the resources it was published to are closed.
+
+Like the other servers it [starts once](#a-server-starts-once): calling `Init`
+on a running server fails with `ErrServerAlreadyStarted` and leaves the socket
+untouched, and so does calling it on a server that was shut down. A start that
+failed opened no socket and can be retried. Inside a List the server is named
+`udp-server` (`udp.DefaultName`); rename it with `WithName` to receive
+several flows side by side:
+
+```go
+primary := udp.NewServer(primaryConfig, receiver).WithName("mv-primary")
+backup := udp.NewServer(backupConfig, receiver).WithName("mv-backup")
+
+err := app.Run(ctx, app.WithResources(primary, backup))
+```
+
+### Configuration
+
+`Config` carries the address, the multicast settings, the size of the buffer
+of a datagram, and the longest silence the server tolerates. The socket is
+IPv4 only (`udp4`). You can fill it in yourself, for a multicast group joined
+on a named interface:
+
+```go
+config := &udp.Config{
+	Address:         "239.1.1.1:5555",
+	Multicast:       true,
+	InterfaceName:   "eth0",
+	BufferSize:      1500,
+	ReceivedTimeout: 5 * time.Second,
+}
+```
+
+Or for a plain UDP socket bound to a local address, which needs no interface:
+
+```go
+config := &udp.Config{
+	Address:         "127.0.0.1:5555",
+	Multicast:       false,
+	BufferSize:      1500,
+	ReceivedTimeout: 20 * time.Minute,
+}
+```
+
+Or read it from the environment with `NewConfigFromEnv`. The variable names and
+the defaults are exported as constants:
+
+| Environment variable | Constant | Default |
+| --- | --- | --- |
+| `UDP_ADDRESS` | `AddressEnvVar` | *(none)* |
+| `UDP_MULTICAST` | `MulticastEnvVar` | `true` (`DefaultMulticast`) |
+| `UDP_INTERFACE_NAME` | `InterfaceNameEnvVar` | *(none)* |
+| `UDP_BUFFER_SIZE` | `BufferSizeEnvVar` | `1500` (`DefaultBufferSize`) |
+| `UDP_RECEIVED_TIMEOUT` | `ReceivedTimeoutEnvVar` | `5s` (`DefaultReceivedTimeout`) |
+
+A variable that is not set falls back to its default. A multicast flag that is
+not a boolean, a buffer size that is not a positive number, or a received
+timeout that is not a duration (or is negative) is a mistake rather than a
+missing value, so `NewConfigFromEnv` fails with `ErrInvalidMulticast`,
+`ErrInvalidBufferSize`, or `ErrInvalidReceivedTimeout` instead of silently
+receiving on the defaults:
+
+```go
+config, err := udp.NewConfigFromEnv()
+if err != nil {
+	return err // udp.ErrInvalidReceivedTimeout, ...
+}
+```
+
+`Init` fails with `ErrEmptyAddress` when the address is empty, with
+`ErrEmptyInterfaceName` when multicast is enabled without an interface, with
+`ErrInvalidBufferSize` when the buffer size is not positive, and with
+`ErrInvalidReceivedTimeout` when the timeout is negative. A timeout of zero is
+valid: it [disables the watchdog](#the-silence-watchdog). `Init` also fails
+with `ErrNilConfig` and `ErrNilHandler` when it is given nothing to work with.
+
+### Writing a handler
+
+A UDP handler implements the one-method `Handler` interface. The server calls
+`Handle` with each `Datagram` it reads, which carries the payload and the
+address it was sent from:
+
+```go
+type Handler interface {
+	Handle(ctx context.Context, datagram Datagram) error
+}
+
+type Datagram struct {
+	Payload []byte
+	Source  netip.AddrPort
+}
+```
+
+A plain function becomes a handler with `HandlerFunc`:
+
+```go
+printer := udp.HandlerFunc(func(_ context.Context, d udp.Datagram) error {
+	fmt.Printf("%d bytes from %s\n", len(d.Payload), d.Source)
+	return nil
+})
+```
+
+A handler with dependencies is written as a type:
+
+```go
+type TrackHandler struct{ publisher Publisher }
+
+func (h *TrackHandler) Handle(ctx context.Context, d udp.Datagram) error {
+	envelope, err := decode(d.Payload)
+	if err != nil {
+		return err // reported to OnError, the server keeps receiving
+	}
+	return h.publisher.Publish(ctx, envelope)
+}
+```
+
+The handler is called synchronously, on the goroutine reading the socket: the
+next datagram is not read until `Handle` returns, which is the back-pressure a
+UDP source needs. A handler that must not slow the reading down enqueues the
+datagram on a channel of its own and returns. The payload is a fresh buffer of
+`BufferSize` bytes trimmed to the length received, so the handler owns it;
+datagrams longer than the buffer are truncated.
+
+The context given to `Handle` carries the values of the `Init` context (a
+logger, a trace) but not its cancellation: it is canceled when the server shuts
+down, so a handler doing long work can stop early.
+
+The errors handlers return never stop the server. They are handed to the
+callback set with `OnError`, which you may call at any time, even while
+datagrams are being handled; without a callback they are dropped:
+
+```go
+server := udp.NewServer(config, &TrackHandler{publisher: nc})
+
+server.OnError(func(err error) {
+	slog.Error("failed to handle a datagram", "err", err)
+})
+```
+
+The server does not log. Logging, tracing, or metrics belong to a handler of
+your own wrapping the next one, which the server cannot tell from any other
+handler:
+
+```go
+func WithLogging(logger *slog.Logger, next udp.Handler) udp.Handler {
+	return udp.HandlerFunc(func(ctx context.Context, d udp.Datagram) error {
+		logger.DebugContext(ctx, "datagram received", "bytes", len(d.Payload), "source", d.Source)
+		return next.Handle(ctx, d)
+	})
+}
+
+server := udp.NewServer(config, WithLogging(logger, &TrackHandler{publisher: nc}))
+```
+
+### The silence watchdog
+
+A UDP source that stops sending leaves a socket open and a server that looks
+fine. The received timeout tells the server how long a silence it tolerates,
+the way the read timeout of the HTTP server bounds a request: every read of
+the socket carries `ReceivedTimeout` as its deadline, so when no datagram
+arrives in time the server closes its socket and reports `StatusFailed`, which
+makes `app.Run` or `resource.Run` stop the application. `Shutdown` then
+returns the failure, wrapping `ErrReceivedTimeout`:
+
+```go
+err := resource.Run(ctx, server)
+switch {
+case errors.Is(err, udp.ErrReceivedTimeout):
+	// silence: no datagram within ReceivedTimeout
+case errors.Is(err, resource.ErrResourceFailed):
+	// the socket could not be read
+case err != nil:
+	// Init failed (bad config, port in use, unknown interface) or Shutdown failed
+}
+```
+
+A `ReceivedTimeout` of zero disables the watchdog, for the sources that are
+legitimately quiet. The deadline bounds the wait for a datagram only, not the
+handler: a slow handler never looks like a silent source.
+
+### Bringing your own socket
+
+`Init` opens the socket with no option but the multicast join. When you need
+more (a larger receive buffer, `SO_REUSEPORT`, source filtering...), open the
+socket yourself and hand it to the server with `WithConnection`. It takes a
+`Connection`, the subset of `*net.UDPConn` the server reads, so any
+`*net.UDPConn` fits:
+
+```go
+conn, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 5555})
+if err != nil {
+	return err
+}
+
+server := udp.NewServer(&udp.Config{BufferSize: 1500}, handler).WithConnection(conn)
+```
+
+The server owns the socket from then on and closes it when it stops. Only the
+buffer size and the received timeout of the configuration are used: the
+address and the multicast settings describe a socket the server does not open.
+`LocalAddress` returns the address of the socket being read, which is handy
+when you bind port `0` and let the operating system pick one, and nil while
+the server is not serving.
+
+### Running the server standalone
+
+`resource.Run` initializes the server, receives until the context is canceled,
+the socket cannot be read, or the source goes silent, then closes the socket
+on the way out. A canceled context is a graceful stop:
+
+```go
+ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt)
+defer stop()
+
+err := resource.Run(ctx, udp.NewServer(config, printer))
+```
 
 ## License
 
