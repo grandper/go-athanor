@@ -43,7 +43,8 @@ type Server struct {
 	status   *resource.ObservableStatus
 
 	mu         sync.Mutex
-	started    bool // claimed by the first successful Init, for good
+	started    bool     // claimed by the first successful Init, for good
+	hooks      *hookSet // frozen once started, so the hooks run without the mutex
 	httpServer *http.Server
 	done       chan struct{} // closed when the serve goroutine exits
 	serveErr   error         // first unexpected serve error, read by Shutdown
@@ -56,12 +57,25 @@ func NewServer(config *Config, handlers ...Handler) *Server {
 		config:   config,
 		handlers: handlers,
 		status:   resource.NewObservableStatus(resource.StatusInitializing),
+		hooks:    &hookSet{},
 	}
 }
 
 // WithName overrides the name identifying the server inside a resource.List.
 func (s *Server) WithName(name string) *Server {
 	s.name = name
+	return s
+}
+
+// WithHooks adds hooks watching the lifecycle of the server. You can call it several times: every hook is kept,
+// and the hooks watching the same event run in the order they were given. The hooks are installed when the server
+// starts, so hooks added after the server started are ignored.
+func (s *Server) WithHooks(hooks ...Hook) *Server {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if !s.started {
+		s.hooks.add(hooks...)
+	}
 	return s
 }
 
@@ -112,11 +126,12 @@ func (s *Server) start(ctx context.Context) error {
 
 	httpServer := &http.Server{
 		Addr:         s.config.Address(),
-		Handler:      router,
+		Handler:      s.hooks.withPanicRecovery(router),
 		ReadTimeout:  readTimeoutDuration,
 		WriteTimeout: writeTimeoutDuration,
 		IdleTimeout:  idleTimeoutDuration,
 	}
+	s.hooks.install(httpServer)
 
 	done := make(chan struct{})
 	s.mu.Lock()

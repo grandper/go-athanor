@@ -16,7 +16,7 @@ type Datagram struct {
 
 // Handler processes the datagrams received by a Server, one at a time, on the goroutine reading the socket.
 type Handler interface {
-	// Handle processes one datagram. An error is reported to the callback set with Server.OnError and does not
+	// Handle processes one datagram. An error is reported to the OnHandlerFailed hooks of the server and does not
 	// stop the server. The context is canceled when the server shuts down.
 	Handle(ctx context.Context, datagram Datagram) error
 }

@@ -40,13 +40,18 @@ type Server struct {
 	handlers []Handler
 	status   *resource.ObservableStatus
 
-	mu            sync.Mutex
-	middlewares   []MiddlewareFunc
-	registrations []registration
-	subscriptions []*nats.Subscription
-	errorHandler  func(err error)
-	started       bool
-	cancelServing context.CancelFunc // cancels the context of the requests
+	mu             sync.Mutex
+	middlewares    []MiddlewareFunc
+	registrations  []registration
+	subscriptions  []*nats.Subscription
+	hooks          *hookSet // frozen once started, so the hooks run without the mutex
+	started        bool
+	cancelServing  context.CancelFunc // cancels the context of the requests
+	resetCallbacks []func()           // resets the connection callbacks the server installed
+
+	// hooksRunning tracks the subscription hooks still to run: the closed handler and the status goroutine of
+	// every subscription.
+	hooksRunning sync.WaitGroup
 }
 
 // NewServer returns a Server consuming messages from the NATS connection nc and dispatching to the handlers.
@@ -56,12 +61,31 @@ func NewServer(nc *nats.Conn, handlers ...Handler) *Server {
 		nc:       nc,
 		handlers: handlers,
 		status:   resource.NewObservableStatus(resource.StatusInitializing),
+		hooks:    &hookSet{},
 	}
 }
 
 // WithName overrides the name identifying the server inside a resource.List.
 func (s *Server) WithName(name string) *Server {
 	s.name = name
+	return s
+}
+
+// WithHooks adds hooks watching the lifecycle of the server. You can call it several times: every hook is kept,
+// and the hooks watching the same event run in the order they were given. The hooks are installed when the server
+// starts, so hooks added after the server started are ignored.
+//
+// While the server runs, it owns the connection callbacks of the events its hooks watch: an OnConnectionLost,
+// OnConnectionRestored or OnConnectionClosed hook replaces the disconnect, reconnect or closed callback given to
+// nats.Connect, which is neither chained nor restored, and Shutdown resets that callback to nil. The callbacks of
+// the events no hook watches are left untouched. Give your connection callbacks through WithHooks rather than
+// nats.Connect.
+func (s *Server) WithHooks(hooks ...Hook) *Server {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if !s.started {
+		s.hooks.add(hooks...)
+	}
 	return s
 }
 
@@ -74,7 +98,10 @@ func (s *Server) Status() *resource.ObservableStatus { return s.status }
 // Init implements resource.Managed. It registers the handlers and starts listening.
 // A server starts once: Init fails with ErrServerAlreadyStarted on a running server and on a server that was
 // shut down, while an Init that failed can be retried.
-func (s *Server) Init(_ context.Context) error {
+//
+// When a subscription fails to open, Init waits for the OnSubscriptionClosed hooks of the subscriptions already
+// opened, or for ctx to be done, before it returns the error.
+func (s *Server) Init(ctx context.Context) error {
 	if s.nc == nil {
 		s.status.Set(resource.StatusFailed)
 		return fmt.Errorf("failed to init the NATS server: %w", ErrNilNATSConnection)
@@ -90,21 +117,45 @@ func (s *Server) Init(_ context.Context) error {
 		}
 	}
 	if err := s.ListenAndServe(); err != nil {
+		// The subscribe error is what matters, whether or not the hooks ran in time.
+		errWait := s.waitForHooks(ctx)
 		s.status.Set(resource.StatusFailed)
-		return err
+		return errors.Join(err, errWait)
 	}
 	s.status.Set(resource.StatusHealthy)
 	return nil
 }
 
-// Shutdown implements resource.Managed. It cancels every subscription.
-func (s *Server) Shutdown(_ context.Context) error {
-	if err := s.Close(); err != nil {
+// Shutdown implements resource.Managed. It cancels every subscription, waits for the subscription hooks to run,
+// then resets to nil the connection callbacks the server installed for its hooks. It fails when a subscription
+// fails to unsubscribe, or when ctx is done before the hooks ran; the connection callbacks are reset either way.
+func (s *Server) Shutdown(ctx context.Context) error {
+	err := s.Close()
+	if waitErr := s.waitForHooks(ctx); err == nil {
+		err = waitErr
+	}
+	s.resetConnectionCallbacks()
+	if err != nil {
 		s.status.Set(resource.StatusFailed)
 		return err
 	}
 	s.status.Set(resource.StatusClosed)
 	return nil
+}
+
+// waitForHooks waits for the subscription hooks still to run, or for ctx to be done.
+func (s *Server) waitForHooks(ctx context.Context) error {
+	done := make(chan struct{})
+	go func() {
+		s.hooksRunning.Wait()
+		close(done)
+	}()
+	select {
+	case <-done:
+		return nil
+	case <-ctx.Done():
+		return fmt.Errorf("failed to wait for the NATS hooks: %w", ctx.Err())
+	}
 }
 
 // isStarted reports whether the server is listening.
@@ -119,13 +170,6 @@ func (s *Server) Use(middlewares ...MiddlewareFunc) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.middlewares = append(s.middlewares, middlewares...)
-}
-
-// OnError sets the callback invoked when a handler returns an error.
-func (s *Server) OnError(handler func(err error)) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	s.errorHandler = handler
 }
 
 // HandleFunc registers handler for the messages published on subject, optionally in a queue group.
@@ -143,9 +187,23 @@ func (s *Server) HandleFunc(subject string, queue string, handler HandlerFunc) e
 	return nil
 }
 
-// ListenAndServe subscribes every registered handler without blocking. It fails when the server is already
-// started; a server that failed to start holds no subscription and can be started again.
+// ListenAndServe subscribes every registered handler without blocking, then installs the connection hooks and
+// reports the connection established. It fails when the server is already started; a server that failed to start
+// holds no subscription, installed no hook, and can be started again.
 func (s *Server) ListenAndServe() error {
+	if err := s.start(); err != nil {
+		return err
+	}
+	// The hooks are frozen once started, and run without the mutex so that they may use the server.
+	if s.nc.IsConnected() {
+		s.hooks.notifyConnectionEstablished(s.nc)
+	}
+	return nil
+}
+
+// start subscribes every registered handler, installs the connection callbacks of the hooks, and marks the server
+// started, under the mutex. ListenAndServe calls the hooks reporting the start once the mutex is released.
+func (s *Server) start() error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -155,6 +213,7 @@ func (s *Server) ListenAndServe() error {
 
 	// The requests outlive Init, so their context is canceled by Close rather than derived from a caller.
 	servingCtx, cancelServing := context.WithCancel(context.Background())
+	closures := make([]<-chan struct{}, 0, len(s.registrations))
 	for _, reg := range s.registrations {
 		subscription, err := s.nc.QueueSubscribe(reg.subject, reg.queue, s.dispatch(servingCtx, reg.handler))
 		if err != nil {
@@ -163,8 +222,16 @@ func (s *Server) ListenAndServe() error {
 			cancelServing()
 			return fmt.Errorf("failed to subscribe to subject %q: %w", reg.subject, err)
 		}
+		closures = append(closures, s.watchClosure(subscription))
 		s.subscriptions = append(s.subscriptions, subscription)
+		s.hooks.notifySubscriptionOpened(s.nc, subscription)
 	}
+	if s.hooks.watchesSubscriptionStatus() {
+		for i, subscription := range s.subscriptions {
+			s.watchStatus(subscription, closures[i])
+		}
+	}
+	s.installConnectionCallbacks()
 	s.started = true
 	s.cancelServing = cancelServing
 	return nil
@@ -182,6 +249,89 @@ func (s *Server) Close() error {
 	return err
 }
 
+// watchClosure installs on subscription a closed handler, tracked by hooksRunning, that closes the returned channel
+// and runs the OnSubscriptionClosed hooks. The status goroutine needs that channel too, so the handler is installed
+// when a hook watches either the closure or the status; otherwise watchClosure installs nothing and returns nil.
+func (s *Server) watchClosure(subscription *nats.Subscription) <-chan struct{} {
+	handler := s.hooks.subscriptionClosedHandler(s.nc, subscription)
+	if handler == nil && !s.hooks.watchesSubscriptionStatus() {
+		return nil
+	}
+	closed := make(chan struct{})
+	s.hooksRunning.Add(1)
+	subscription.SetClosedHandler(func(subject string) {
+		defer s.hooksRunning.Done()
+		close(closed)
+		if handler != nil {
+			handler(subject)
+		}
+	})
+	return closed
+}
+
+// watchStatus starts the goroutine reporting the status changes of subscription to the OnSubscriptionStatusChanged
+// hooks, tracked by hooksRunning. The goroutine ends when the client closes the channel of the statuses, or when
+// the subscription closed; the client never reports nats.SubscriptionClosed when the connection closes, so the
+// goroutine reports it then. Repeated statuses are dropped, so Closed is reported once even when the client sent it.
+func (s *Server) watchStatus(subscription *nats.Subscription, closed <-chan struct{}) {
+	statuses := subscription.StatusChanged()
+	s.hooksRunning.Add(1)
+	go func() {
+		defer s.hooksRunning.Done()
+		last := nats.SubscriptionActive
+		change := func(status nats.SubStatus) {
+			if status != last {
+				last = status
+				s.hooks.notifySubscriptionStatusChanged(s.nc, subscription, status)
+			}
+		}
+		defer func() { change(nats.SubscriptionClosed) }()
+
+		for {
+			select {
+			case status, ok := <-statuses:
+				if !ok {
+					return
+				}
+				change(status)
+			case <-closed:
+				// Report the statuses the client already sent, without waiting for more.
+				for len(statuses) > 0 {
+					change(<-statuses)
+				}
+				return
+			}
+		}
+	}()
+}
+
+// installConnectionCallbacks installs the connection callbacks the hooks watch, and remembers how to reset them.
+// The caller must hold the mutex.
+func (s *Server) installConnectionCallbacks() {
+	if handler := s.hooks.disconnectErrHandler(); handler != nil {
+		s.nc.SetDisconnectErrHandler(handler)
+		s.resetCallbacks = append(s.resetCallbacks, func() { s.nc.SetDisconnectErrHandler(nil) })
+	}
+	if handler := s.hooks.reconnectHandler(); handler != nil {
+		s.nc.SetReconnectHandler(handler)
+		s.resetCallbacks = append(s.resetCallbacks, func() { s.nc.SetReconnectHandler(nil) })
+	}
+	if handler := s.hooks.closedHandler(); handler != nil {
+		s.nc.SetClosedHandler(handler)
+		s.resetCallbacks = append(s.resetCallbacks, func() { s.nc.SetClosedHandler(nil) })
+	}
+}
+
+// resetConnectionCallbacks resets to nil the connection callbacks the server installed.
+func (s *Server) resetConnectionCallbacks() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for _, reset := range s.resetCallbacks {
+		reset()
+	}
+	s.resetCallbacks = nil
+}
+
 // unsubscribeAll cancels every subscription; the caller must hold the mutex.
 func (s *Server) unsubscribeAll() error {
 	var firstErr error
@@ -194,7 +344,7 @@ func (s *Server) unsubscribeAll() error {
 	return firstErr
 }
 
-// dispatch adapts handler to a nats.MsgHandler with the middleware chain and error callback.
+// dispatch adapts handler to a nats.MsgHandler with the middleware chain and the OnHandlerFailed hooks.
 // The caller must hold the mutex.
 func (s *Server) dispatch(ctx context.Context, handler HandlerFunc) nats.MsgHandler {
 	for i := len(s.middlewares) - 1; i >= 0; i-- {
@@ -204,19 +354,8 @@ func (s *Server) dispatch(ctx context.Context, handler HandlerFunc) nats.MsgHand
 	return func(msg *nats.Msg) {
 		request := &Request{Context: ctx, Msg: msg}
 		if err := handler(request, s.nc.PublishMsg); err != nil {
-			s.reportError(err)
+			s.hooks.notifyHandlerFailed(s.nc, msg, err)
 		}
-	}
-}
-
-// reportError hands err to the callback set with OnError, which may change while messages are dispatched.
-func (s *Server) reportError(err error) {
-	s.mu.Lock()
-	errorHandler := s.errorHandler
-	s.mu.Unlock()
-
-	if errorHandler != nil {
-		errorHandler(err)
 	}
 }
 

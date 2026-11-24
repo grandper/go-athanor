@@ -90,7 +90,6 @@ func (a *App) runParticipants(ctx context.Context) error {
 		g.Go(func() error { return gracefulManage(groupCtx, a.resources) })
 	}
 	for _, p := range a.processes {
-		p := p // shared loop variable before go 1.22
 		g.Go(func() error { return p(groupCtx) })
 	}
 

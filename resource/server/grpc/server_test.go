@@ -3,6 +3,7 @@ package grpc_test
 import (
 	"context"
 	"errors"
+	"sync"
 	"syscall"
 	"testing"
 	"time"
@@ -39,6 +40,64 @@ func TestServer(t *testing.T) {
 		server := grpcserver.NewServer(config).WithName("public-grpc")
 
 		assert.Equal(t, "public-grpc", server.Name())
+	})
+
+	t.Run("should return the same server from WithHooks", func(t *testing.T) {
+		server := newHealthServer()
+
+		assert.Same(t, server, server.WithHooks(fixture.NewHookRecorder().Hooks()...))
+	})
+
+	t.Run("should keep the hooks of every WithHooks call", func(t *testing.T) {
+		first, second := fixture.NewHookRecorder(), fixture.NewHookRecorder()
+		server := newHealthServer().WithHooks(first.Hooks()...)
+		server.WithHooks(second.Hooks()...)
+		client := serveOnFreePort(t, server)
+
+		_, err := checkHealth(t, client, "orders")
+
+		require.Error(t, err)
+		want := []string{"handler failed: /grpc.health.v1.Health/Check: NotFound"}
+		assert.Equal(t, want, first.EventsContaining("handler "))
+		assert.Equal(t, want, second.EventsContaining("handler "))
+	})
+
+	t.Run("should ignore the hooks added after Init", func(t *testing.T) {
+		early, late := fixture.NewHookRecorder(), fixture.NewHookRecorder()
+		server := newHealthServer().WithHooks(early.Hooks()...)
+		client := serveOnFreePort(t, server)
+
+		server.WithHooks(late.Hooks()...)
+		_, err := checkHealth(t, client, "orders")
+
+		require.Error(t, err)
+		assert.Equal(t, []string{"handler failed: /grpc.health.v1.Health/Check: NotFound"},
+			early.EventsContaining("handler "))
+		assert.Empty(t, late.Events(), "a hook added after Init must be ignored")
+	})
+
+	t.Run("should let hooks be added while requests are served", func(t *testing.T) {
+		const requestCount = 20
+		server := newHealthServer().WithHooks(fixture.NewHookRecorder().Hooks()...)
+		client := serveOnFreePort(t, server)
+
+		// The race detector fails the test when the requests read the hooks without synchronization.
+		var group sync.WaitGroup
+		group.Add(2)
+		go func() {
+			defer group.Done()
+			for range requestCount {
+				server.WithHooks(fixture.NewHookRecorder().Hooks()...)
+			}
+		}()
+		go func() {
+			defer group.Done()
+			for range requestCount {
+				_, err := checkHealth(t, client, "orders")
+				assert.Equal(t, codes.NotFound, status.Code(err))
+			}
+		}()
+		group.Wait()
 	})
 
 	t.Run("should register the handlers and report StatusHealthy", func(t *testing.T) {

@@ -3,6 +3,8 @@ package fixture
 import (
 	"context"
 	"encoding/json"
+	"errors"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -70,4 +72,15 @@ func statusCodeOf(url string) int {
 	}
 	defer func() { _ = response.Body.Close() }()
 	return response.StatusCode
+}
+
+// AssertStaysOpen asserts that the other end neither closes conn nor writes to it for duration.
+func AssertStaysOpen(t *testing.T, conn net.Conn, duration time.Duration) {
+	t.Helper()
+
+	require.NoError(t, conn.SetReadDeadline(time.Now().Add(duration)))
+	defer func() { _ = conn.SetReadDeadline(time.Time{}) }()
+	_, err := conn.Read(make([]byte, 1))
+	var netErr net.Error
+	assert.True(t, errors.As(err, &netErr) && netErr.Timeout(), "the connection did not stay open: %v", err)
 }

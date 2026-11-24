@@ -106,26 +106,62 @@ func TestServer(t *testing.T) {
 		assert.Equal(t, []byte("hell"), handler.WaitForDatagram(t, receiveTimeout).Payload)
 	})
 
-	t.Run("should report the handler errors to the OnError callback and keep serving", func(t *testing.T) {
+	t.Run("should report the handler errors to the OnHandlerFailed hooks and keep serving", func(t *testing.T) {
 		errHandle := errors.New("handling failed")
 		handler := fixture.NewRecordingHandler().FailWith(errHandle)
-		server := udp.NewServer(newPlainConfig(), handler)
-		reported := make(chan error, 1)
-		server.OnError(func(err error) { reported <- err })
+		recorder := fixture.NewErrorRecorder()
+		server := udp.NewServer(newPlainConfig(), handler).WithHooks(recorder.Hooks()...)
 		initServer(ctx, t, server)
 
 		fixture.SendDatagram(t, server.LocalAddress(), []byte("first"))
 		assert.Equal(t, []byte("first"), handler.WaitForDatagram(t, receiveTimeout).Payload)
 
-		err := athanorfixture.Receive(t, reported, receiveTimeout, "the error was never reported")
+		failures := recorder.WaitForFailures(t, 1, receiveTimeout)
 
-		require.ErrorIs(t, err, errHandle)
+		require.ErrorIs(t, failures[0].Err, errHandle)
 		assert.Equal(t, resource.StatusHealthy, server.Status().Get())
 		fixture.SendDatagram(t, server.LocalAddress(), []byte("second"))
 		assert.Equal(t, []byte("second"), handler.WaitForDatagram(t, receiveTimeout).Payload)
 	})
 
-	t.Run("should keep serving when a handler fails and no callback is set", func(t *testing.T) {
+	t.Run("should return the same server from WithHooks", func(t *testing.T) {
+		server := udp.NewServer(newPlainConfig(), fixture.NewRecordingHandler())
+
+		assert.Same(t, server, server.WithHooks(fixture.NewErrorRecorder().Hooks()...))
+	})
+
+	t.Run("should keep the hooks of every WithHooks call", func(t *testing.T) {
+		first, second := fixture.NewErrorRecorder(), fixture.NewErrorRecorder()
+		server := udp.NewServer(newPlainConfig(), fixture.NewRecordingHandler().FailWith(errors.New("boom"))).
+			WithHooks(first.Hooks()...)
+		server.WithHooks(second.Hooks()...)
+		initServer(ctx, t, server)
+
+		fixture.SendDatagram(t, server.LocalAddress(), []byte("frame"))
+
+		want := []string{`handler failed: "frame": boom`}
+		assert.Equal(t, want, first.WaitForEvents(t, 1, receiveTimeout))
+		assert.Equal(t, want, second.WaitForEvents(t, 1, receiveTimeout))
+	})
+
+	t.Run("should ignore the hooks added after Init", func(t *testing.T) {
+		early, late := fixture.NewErrorRecorder(), fixture.NewErrorRecorder()
+		server := udp.NewServer(newPlainConfig(), fixture.NewRecordingHandler().FailWith(errors.New("boom"))).
+			WithHooks(early.Hooks()...)
+		initServer(ctx, t, server)
+
+		server.WithHooks(late.Hooks()...)
+		fixture.SendDatagram(t, server.LocalAddress(), []byte("first"))
+		early.WaitForFailures(t, 1, receiveTimeout)
+		fixture.SendDatagram(t, server.LocalAddress(), []byte("second"))
+
+		// The read loop handles one datagram after the other, so once the early hooks saw the second datagram, a
+		// late hook would have finished with the first one.
+		early.WaitForFailures(t, 2, receiveTimeout)
+		assert.Empty(t, late.Events(), "a hook added after Init must be ignored")
+	})
+
+	t.Run("should keep serving when a handler fails and no hook is set", func(t *testing.T) {
 		handler := fixture.NewRecordingHandler().FailWith(assert.AnError)
 		server := udp.NewServer(newPlainConfig(), handler)
 		initServer(ctx, t, server)
@@ -374,7 +410,7 @@ func TestServer(t *testing.T) {
 			statuses = append(statuses, s)
 		}))()
 
-		for i := 0; i < 20; i++ {
+		for range 20 {
 			fixture.SendDatagram(t, server.LocalAddress(), []byte("tick"))
 			time.Sleep(30 * time.Millisecond)
 		}

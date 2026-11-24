@@ -52,7 +52,7 @@ func TestStepRecorder(t *testing.T) {
 	t.Run("should record steps running concurrently", func(t *testing.T) {
 		recorder := fixture.NewStepRecorder()
 		var wg sync.WaitGroup
-		for i := 0; i < 50; i++ {
+		for range 50 {
 			wg.Add(1)
 			go func() {
 				defer wg.Done()

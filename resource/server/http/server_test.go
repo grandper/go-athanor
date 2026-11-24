@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io/fs"
 	"net/http"
+	"sync"
 	"syscall"
 	"testing"
 	"time"
@@ -40,6 +41,67 @@ func TestServer(t *testing.T) {
 			WithName("public-http")
 
 		assert.Equal(t, "public-http", server.Name())
+	})
+
+	t.Run("should return the same server from WithHooks", func(t *testing.T) {
+		server := httpserver.NewServer(&httpserver.Config{BindInterface: "127.0.0.1", BindPort: 8080})
+
+		assert.Same(t, server, server.WithHooks(fixture.NewHookRecorder().Hooks()...))
+	})
+
+	t.Run("should keep the hooks of every WithHooks call", func(t *testing.T) {
+		first, second := fixture.NewHookRecorder(), fixture.NewHookRecorder()
+		config, server := newOrdersServer("boom")
+		server.WithHooks(first.Hooks()...)
+		server.WithHooks(second.Hooks()...)
+		baseURL := serveOnFreePort(t, config, server)
+
+		_, err := fixture.GetWithoutKeepAlive(ctx, baseURL+"/orders/42")
+
+		require.NoError(t, err)
+		want := []string{"handler panicked: GET /orders/42: boom"}
+		assert.Equal(t, want, first.EventsContaining("handler panicked"))
+		assert.Equal(t, want, second.EventsContaining("handler panicked"))
+	})
+
+	t.Run("should ignore the hooks added after Init", func(t *testing.T) {
+		early, late := fixture.NewHookRecorder(), fixture.NewHookRecorder()
+		config, server := newOrdersServer("boom")
+		baseURL := serveOnFreePort(t, config, server.WithHooks(early.Hooks()...))
+
+		server.WithHooks(late.Hooks()...)
+		_, err := fixture.GetWithoutKeepAlive(ctx, baseURL+"/orders/42")
+
+		require.NoError(t, err)
+		assert.Equal(t, []string{"handler panicked: GET /orders/42: boom"},
+			early.EventsContaining("handler panicked"))
+		assert.Empty(t, late.Events(), "a hook added after Init must be ignored")
+	})
+
+	t.Run("should let hooks be added while requests are served", func(t *testing.T) {
+		const requestCount = 20
+		config, server := newOrdersServer("boom")
+		baseURL := serveOnFreePort(t, config, server.WithHooks(fixture.NewHookRecorder().Hooks()...))
+
+		// The race detector fails the test when the requests read the hooks without synchronization.
+		var group sync.WaitGroup
+		group.Add(2)
+		go func() {
+			defer group.Done()
+			for range requestCount {
+				server.WithHooks(fixture.NewHookRecorder().Hooks()...)
+			}
+		}()
+		go func() {
+			defer group.Done()
+			for range requestCount {
+				response, err := fixture.GetWithoutKeepAlive(ctx, baseURL+"/orders/42")
+				if assert.NoError(t, err) {
+					assert.Equal(t, http.StatusInternalServerError, response.StatusCode)
+				}
+			}
+		}()
+		group.Wait()
 	})
 
 	t.Run("should register the handlers and report StatusHealthy", func(t *testing.T) {

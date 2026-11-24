@@ -8,7 +8,6 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
-	athanorfixture "github.com/grandper/go-athanor/fixture"
 	"github.com/grandper/go-athanor/resource"
 	resourcefixture "github.com/grandper/go-athanor/resource/fixture"
 	natsserver "github.com/grandper/go-athanor/resource/server/nats"
@@ -82,14 +81,16 @@ func TestHealthHandler(t *testing.T) {
 
 	t.Run("fails when the request has no reply subject", func(t *testing.T) {
 		nc := fixture.ConnectToEmbeddedServer(t)
-		server := natsserver.NewServer(nc, natsserver.NewHealthHandler(resource.NewList()))
-		reported := make(chan error, 1)
-		server.OnError(func(err error) { reported <- err })
+		recorder := fixture.NewHookRecorder()
+		server := natsserver.NewServer(nc, natsserver.NewHealthHandler(resource.NewList())).
+			WithHooks(recorder.HandlerFailedHook())
 		require.NoError(t, server.Init(ctx))
 
 		require.NoError(t, nc.Publish("health", nil))
 
-		err := athanorfixture.Receive(t, reported, requestTimeout, "the error handler was never called")
-		assert.ErrorIs(t, err, natsserver.ErrNoReplySubject)
+		recorder.WaitForEvents(t, 1)
+		failure := recorder.HandlerFailures()[0]
+		assert.Equal(t, "health", failure.Msg.Subject)
+		assert.ErrorIs(t, failure.Err, natsserver.ErrNoReplySubject)
 	})
 }

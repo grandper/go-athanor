@@ -7,7 +7,6 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
-	athanorfixture "github.com/grandper/go-athanor/fixture"
 	natsserver "github.com/grandper/go-athanor/resource/server/nats"
 	"github.com/grandper/go-athanor/resource/server/nats/fixture"
 )
@@ -28,11 +27,10 @@ func TestHandlerFunc(t *testing.T) {
 		assert.Equal(t, []byte("order"), requests[0].Msg.Data)
 	})
 
-	t.Run("should report handler errors to the error handler", func(t *testing.T) {
+	t.Run("should report handler errors to the OnHandlerFailed hooks", func(t *testing.T) {
 		nc := fixture.ConnectToEmbeddedServer(t)
-		server := natsserver.NewServer(nc)
-		reported := make(chan error, 1)
-		server.OnError(func(err error) { reported <- err })
+		recorder := fixture.NewHookRecorder()
+		server := natsserver.NewServer(nc).WithHooks(recorder.HandlerFailedHook())
 		errHandle := errors.New("boom")
 		handle := fixture.NewFakeHandlerFunc().FailWith(errHandle).Handle
 		require.NoError(t, server.HandleFunc("orders.created", "", handle))
@@ -40,7 +38,7 @@ func TestHandlerFunc(t *testing.T) {
 
 		require.NoError(t, nc.Publish("orders.created", nil))
 
-		err := athanorfixture.Receive(t, reported, requestTimeout, "the error handler was never called")
-		assert.ErrorIs(t, err, errHandle)
+		assert.Equal(t, []string{"handler failed: orders.created: boom"}, recorder.WaitForEvents(t, 1))
+		assert.ErrorIs(t, recorder.HandlerFailures()[0].Err, errHandle)
 	})
 }

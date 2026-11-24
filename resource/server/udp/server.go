@@ -47,8 +47,8 @@ type Server struct {
 	status     *resource.ObservableStatus
 
 	mu            sync.Mutex
-	started       bool // claimed by the first successful Init, for good
-	errorHandler  func(err error)
+	started       bool               // claimed by the first successful Init, for good
+	hooks         *hookSet           // frozen once started, so the hooks run without the mutex
 	active        Connection         // the socket being read, set by a successful Init
 	cancelServing context.CancelFunc // cancels the context of the handler
 	stopped       bool               // the socket was closed, for good
@@ -65,6 +65,7 @@ func NewServer(config *Config, handler Handler) *Server {
 		config:  config,
 		handler: handler,
 		status:  resource.NewObservableStatus(resource.StatusInitializing),
+		hooks:   &hookSet{},
 	}
 }
 
@@ -82,6 +83,18 @@ func (s *Server) WithConnection(connection Connection) *Server {
 	return s
 }
 
+// WithHooks adds hooks watching the lifecycle of the server. You can call it several times: every hook is kept,
+// and the hooks watching the same event run in the order they were given. The hooks are installed when the server
+// starts, so hooks added after the server started are ignored.
+func (s *Server) WithHooks(hooks ...Hook) *Server {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if !s.started {
+		s.hooks.add(hooks...)
+	}
+	return s
+}
+
 // Name implements resource.Managed.
 func (s *Server) Name() string { return s.name }
 
@@ -96,13 +109,6 @@ func (s *Server) LocalAddress() net.Addr {
 		return nil
 	}
 	return s.active.LocalAddr()
-}
-
-// OnError sets the callback invoked when the handler returns an error. It can be set at any time.
-func (s *Server) OnError(handler func(err error)) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	s.errorHandler = handler
 }
 
 // Init implements resource.Managed. It opens the socket and reads it in the background.
@@ -241,7 +247,7 @@ func (s *Server) serve(ctx context.Context, conn Connection) {
 
 		datagram := Datagram{Payload: buffer[:n], Source: source}
 		if errHandle := s.handler.Handle(ctx, datagram); errHandle != nil {
-			s.reportError(errHandle)
+			s.hooks.notifyHandlerFailed(datagram, errHandle)
 		}
 	}
 }
@@ -289,17 +295,6 @@ func (s *Server) stopServing() {
 	// Canceled before the close, so the read loop takes the close for the graceful stop it is.
 	s.cancelServing()
 	s.closeErr = s.active.Close()
-}
-
-// reportError hands err to the callback set with OnError, which may change while datagrams are handled.
-func (s *Server) reportError(err error) {
-	s.mu.Lock()
-	errorHandler := s.errorHandler
-	s.mu.Unlock()
-
-	if errorHandler != nil {
-		errorHandler(err)
-	}
 }
 
 // Shutdown implements resource.Managed. It closes the socket and waits for the handler to return, or for

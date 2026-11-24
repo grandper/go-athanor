@@ -1,10 +1,15 @@
 package fixture_test
 
 import (
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"sync/atomic"
 	"testing"
+	"time"
+
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 
 	"github.com/grandper/go-athanor/resource/server/http/fixture"
 )
@@ -68,5 +73,29 @@ func TestAssertEventuallyResponds(t *testing.T) {
 		defer server.Close()
 
 		fixture.AssertEventuallyResponds(t, server.URL, http.StatusOK)
+	})
+}
+
+func TestAssertStaysOpen(t *testing.T) {
+	t.Run("should pass while the other end keeps the connection open and silent", func(t *testing.T) {
+		local, remote := net.Pipe()
+		defer func() { _ = local.Close() }()
+		defer func() { _ = remote.Close() }()
+
+		fixture.AssertStaysOpen(t, local, 20*time.Millisecond)
+	})
+
+	t.Run("should leave the connection usable afterward", func(t *testing.T) {
+		local, remote := net.Pipe()
+		defer func() { _ = local.Close() }()
+		defer func() { _ = remote.Close() }()
+		fixture.AssertStaysOpen(t, local, 20*time.Millisecond)
+
+		go func() { _, _ = remote.Write([]byte("x")) }()
+
+		buffer := make([]byte, 1)
+		_, err := local.Read(buffer)
+		require.NoError(t, err)
+		assert.Equal(t, []byte("x"), buffer)
 	})
 }

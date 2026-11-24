@@ -6,6 +6,7 @@ import (
 	"errors"
 	"net"
 	"strconv"
+	"sync"
 	"syscall"
 	"testing"
 	"time"
@@ -49,7 +50,7 @@ func OnFreePort(t *testing.T, use func(port int) error) error {
 	t.Helper()
 
 	var err error
-	for attempt := 0; attempt < FreePortAttempts; attempt++ {
+	for range FreePortAttempts {
 		err = use(GetFreePort(t))
 		if !errors.Is(err, syscall.EADDRINUSE) {
 			return err
@@ -69,7 +70,7 @@ func RunOnFreePort(t *testing.T, run func(port int) error) (int, <-chan error) {
 
 	var port int
 	var result chan error
-	for attempt := 0; attempt < FreePortAttempts; attempt++ {
+	for range FreePortAttempts {
 		port = GetFreePort(t)
 		result = make(chan error, 1)
 		go func(port int, result chan<- error) { result <- run(port) }(port, result)
@@ -150,3 +151,44 @@ func CanConnect(address string) bool {
 	_ = conn.Close()
 	return true
 }
+
+// FailingListener is a [net.Listener] whose Accept always fails with a configured error.
+type FailingListener struct {
+	err error
+
+	mu     sync.Mutex
+	closed bool
+}
+
+// NewFailingListener returns a FailingListener failing every Accept with err.
+func NewFailingListener(err error) *FailingListener {
+	return &FailingListener{err: err}
+}
+
+// Accept implements the net.Listener interface. It always fails with the configured error.
+func (l *FailingListener) Accept() (net.Conn, error) {
+	return nil, l.err
+}
+
+// Close implements the net.Listener interface. It records that the listener was closed.
+func (l *FailingListener) Close() error {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	l.closed = true
+	return nil
+}
+
+// Addr implements the net.Listener interface. It returns an unbound loopback TCP address.
+func (l *FailingListener) Addr() net.Addr {
+	return &net.TCPAddr{IP: net.IPv6loopback}
+}
+
+// WasClosed reports whether Close was called.
+func (l *FailingListener) WasClosed() bool {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.closed
+}
+
+// FailingListener implements the net.Listener interface.
+var _ net.Listener = (*FailingListener)(nil)

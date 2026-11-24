@@ -48,6 +48,12 @@ happen — which is exactly what this library does for your processes.
 - HTTP, gRPC, NATS, and UDP servers that are managed resources, each populated
   by pluggable handlers. The UDP server receives plain or multicast datagrams
   and watches over the silence of its source.
+- Lifecycle hooks on every server (`WithHooks`), telling you when one of your
+  handlers fails or panics, and, on HTTP, when `net/http` logs an error, a
+  client connection changes status, or the shutdown starts; on gRPC, when a
+  client connects or disconnects, and the statistics of every request; on
+  NATS, when the connection is established, lost, restored, or closed, and
+  when a subscription opens, changes status, or closes.
 - A standalone runner (`resource.Run`) for the programs made of a single
   resource, such as one server.
 - A ready-made `HealthHandler` for every server, reporting the health of your
@@ -61,7 +67,7 @@ happen — which is exactly what this library does for your processes.
 ```bash
 go get github.com/grandper/go-athanor
 ```
-The library requires Go 1.21 or later.
+The library requires Go 1.27.3 or later.
 
 ## Packages at a glance
 
@@ -745,6 +751,102 @@ The gRPC and the NATS servers have the very same handler, built from a List
 the very same way: see [The health handler](#the-health-handler) and
 [Exposing the health over NATS](#exposing-the-health-over-nats).
 
+### Hooking into the server lifecycle
+
+The server builds its `http.Server` itself, so hooks are the way to hear what
+`net/http` sees while it serves. A hook is a callback you give the server with
+`WithHooks`, built with an `OnXxx` constructor of the `httpserver` package.
+`WithHooks` chains off `NewServer` like `WithName`, and you can call it several
+times: every hook is kept, and the hooks watching the same event run in the
+order you gave them. A `nil` callback is ignored. The hooks are installed when
+the server starts, so give them before `Init` or `resource.Run`: a hook added
+once the server started is ignored. A hook runs on the goroutine that saw the
+event, so it must not block, and it must not shut its own server down.
+
+Every hook of every server is named `On`, then what the event happened to,
+then what happened to it, in the past tense:
+
+| What happened | Hooks |
+|---|---|
+| A connection went through its life | `OnConnectionEstablished`, `OnConnectionLost`, `OnConnectionRestored`, `OnConnectionClosed`, `OnConnectionStatusChanged` |
+| A subscription went through its life | `OnSubscriptionOpened`, `OnSubscriptionStatusChanged`, `OnSubscriptionClosed` |
+| Your handler did not complete | `OnHandlerFailed`, `OnHandlerPanicked` |
+| The server reported something | `OnErrorLogged`, `OnShutdownStarted`, `OnRequestStatsReported` |
+
+The same event has the same name on every server: a handler returning an error
+is `OnHandlerFailed` on NATS, UDP, and gRPC alike, and a handler that panics is
+`OnHandlerPanicked` on HTTP and gRPC alike. So you can guess the hook from the
+event you want to watch.
+
+#### Watching the handlers
+
+`OnHandlerPanicked` fires each time a handler panics. It receives the request
+and the value the handler panicked with, then the server answers
+`500 Internal Server Error` and keeps serving. It runs on the goroutine of the
+request:
+
+```go
+server := httpserver.NewServer(config, orderHandler).WithHooks(
+	httpserver.OnHandlerPanicked(func(r *http.Request, recovered any) {
+		slog.Error("HTTP handler panicked", "path", r.URL.Path, "panic", recovered)
+	}),
+)
+// GET /orders/42 panics → 500 Internal Server Error, and the hook is called
+```
+
+When the handler already wrote the response header before it panicked, the
+status can no longer change. A handler that panics with `http.ErrAbortHandler`,
+the standard way to abort a response, is not reported: the panic goes on to
+`net/http`, which drops the connection. Without an `OnHandlerPanicked` hook,
+the server keeps the behavior of `net/http`: it logs the panic and closes the
+connection.
+
+#### Watching the server
+
+`OnErrorLogged` fires for each error `net/http` logs: TLS handshake failures,
+accept errors, and the panics of the handlers when no `OnHandlerPanicked` hook
+exists. It runs on the goroutine that hit the error:
+
+```go
+server := httpserver.NewServer(config, orderHandler).WithHooks(
+	httpserver.OnErrorLogged(func(err error) { slog.Error("HTTP server error", "err", err) }),
+)
+// a client sends bytes that are neither TLS nor HTTP to the TLS port:
+// err: http: TLS handshake error from 10.0.0.7:51432: tls: first record does not look like a TLS handshake
+```
+
+The error carries the text `net/http` logged, its trailing newline trimmed: it
+is not a typed error, so read it, do not match it with `errors.Is`.
+
+`OnShutdownStarted` fires once, when `Shutdown` starts. `Shutdown` does not
+close the hijacked connections, such as WebSockets, and this hook is where you
+close them:
+
+```go
+server := httpserver.NewServer(config, chatHandler).WithHooks(
+	httpserver.OnShutdownStarted(func() { websockets.CloseAll() }),
+)
+```
+
+`net/http` runs it on a goroutine of its own and does not wait for it, so
+`Shutdown` does not either.
+
+#### Watching the connections
+
+`OnConnectionStatusChanged` fires on each change of status of a client
+connection: new, active, idle, hijacked, closed. The status is the
+`http.ConnState` of `net/http`, and the hook runs on the goroutine of the
+connection:
+
+```go
+server := httpserver.NewServer(config, orderHandler).WithHooks(
+	httpserver.OnConnectionStatusChanged(func(conn net.Conn, status http.ConnState) {
+		slog.Debug("HTTP connection", "remote", conn.RemoteAddr(), "status", status)
+	}),
+)
+// one GET request, then Shutdown: new, active, idle, closed
+```
+
 ## The gRPC server
 
 The `resource/server/grpc` package is the gRPC counterpart of the HTTP server.
@@ -898,6 +1000,89 @@ func (h *accountServiceHandler) GetAccount(ctx context.Context, req *accountv1.G
 }
 ```
 
+### Hooking into the server lifecycle
+
+A hook is a callback you give the server with `WithHooks`, built with an
+`OnXxx` constructor of the `grpcserver` package. `WithHooks` chains off
+`NewServer` like `WithName`, and you can call it several times: every hook is
+kept, and the hooks watching the same event run in the order you gave them. A
+`nil` callback is ignored. The hooks are installed when the server starts, so
+give them before `Init` or `resource.Run`: a hook added once the server started
+is ignored. A hook runs on the goroutine that saw the event, so it must not
+block, and it must not shut its own server down.
+
+#### Watching the handlers
+
+`OnHandlerFailed` fires for each unary or stream request whose handler returns
+an error. It receives the context of the request and the full method name, and
+`status.Code(err)` gives you the gRPC code:
+
+```go
+server := grpcserver.NewServer(config, grpcserver.NewHealthHandler(resources)).WithHooks(
+	grpcserver.OnHandlerFailed(func(ctx context.Context, method string, err error) {
+		slog.ErrorContext(ctx, "gRPC handler failed", "method", method, "code", status.Code(err))
+	}),
+)
+// a client checks the health of an unknown service:
+// method=/grpc.health.v1.Health/Check code=NotFound
+```
+
+`OnHandlerPanicked` fires each time a unary or stream handler panics. The
+request fails with `codes.Internal` and the server keeps serving:
+
+```go
+server := grpcserver.NewServer(config, orderHandler).WithHooks(
+	grpcserver.OnHandlerPanicked(func(ctx context.Context, method string, recovered any) {
+		slog.ErrorContext(ctx, "gRPC handler panicked", "method", method, "panic", recovered)
+	}),
+)
+// the client receives: rpc error: code = Internal desc = internal error
+```
+
+`OnHandlerFailed` also sees the `codes.Internal` error of a recovered panic.
+Both hooks run on the goroutine of the request. Without an `OnHandlerPanicked`
+hook, the server keeps the behavior of gRPC: a panicking handler crashes the
+whole process.
+
+#### Watching the connections
+
+`OnConnectionEstablished` fires each time a client connection is established,
+and `OnConnectionClosed` each time one closes, including the connections
+`Shutdown` closes. Both receive a `*stats.ConnTagInfo` holding the remote and
+local addresses, and run on the goroutine of the transport:
+
+```go
+server := grpcserver.NewServer(config, orderHandler).WithHooks(
+	grpcserver.OnConnectionEstablished(func(ctx context.Context, info *stats.ConnTagInfo) {
+		slog.Info("gRPC client connected", "remote", info.RemoteAddr)
+	}),
+	grpcserver.OnConnectionClosed(func(ctx context.Context, info *stats.ConnTagInfo) {
+		slog.Info("gRPC client disconnected", "remote", info.RemoteAddr)
+	}),
+)
+```
+
+gRPC does not guarantee that a connection is reported closed before the server
+stops, so `Shutdown` does not wait for `OnConnectionClosed`.
+
+#### Watching the statistics of the requests
+
+`OnRequestStatsReported` fires for each statistics event of each request:
+begin, headers, payloads, trailers, end. It runs on the goroutine of the
+request and fires very often, so keep it cheap:
+
+```go
+server := grpcserver.NewServer(config, orderHandler).WithHooks(
+	grpcserver.OnRequestStatsReported(func(ctx context.Context, requestStats stats.RPCStats) {
+		if end, ok := requestStats.(*stats.End); ok {
+			metrics.Observe("grpc.duration", end.EndTime.Sub(end.BeginTime))
+		}
+	}),
+)
+// one unary request reports *stats.InHeader, *stats.Begin, *stats.InPayload,
+// *stats.OutHeader, *stats.OutPayload, *stats.OutTrailer, then *stats.End
+```
+
 ### Running the server standalone
 
 `resource.Run` serves the handlers until the context is canceled or the server
@@ -991,14 +1176,12 @@ func (h *OrderHandler) handleCreated(r *natsserver.Request, publish natsserver.P
 }
 ```
 
-### Middlewares and error handling
+### Middlewares
 
 A middleware is a `MiddlewareFunc`, a function wrapping a `HandlerFunc`.
 Middlewares registered with `Use` wrap every handler, the first one being the
 outermost. Register them before the server starts: the chain is assembled when
-the server subscribes its handlers, and a later `Use` has no effect. The errors
-handlers return are handed to the callback set with `OnError`, which — unlike
-`Use` — you may call at any time, even while messages are being dispatched:
+the server subscribes its handlers, and a later `Use` has no effect:
 
 ```go
 server := natsserver.NewServer(nc, orderHandler)
@@ -1009,10 +1192,130 @@ server.Use(func(next natsserver.HandlerFunc) natsserver.HandlerFunc {
 		return next(r, publish)
 	}
 })
+```
 
-server.OnError(func(err error) {
-	slog.Error("failed to handle a message", "err", err)
-})
+### Hooking into the server lifecycle
+
+A hook is a callback you give the server with `WithHooks`, and the server calls
+it when something happens while it runs. You build each hook with an `OnXxx`
+constructor of the `natsserver` package, so the statement reads as a sentence.
+`WithHooks` chains off `NewServer` like `WithName`. You can call it several
+times: every hook is kept, and the hooks watching the same event run in the
+order you gave them. A `nil` callback is ignored.
+
+The hooks are installed when the server starts, so give them before `Init`,
+`resource.Run`, or `ListenAndServe`: a hook added once the server started is
+ignored. A hook runs on the goroutine that saw the event, so it must not block,
+and it must not shut its own server down.
+
+#### Watching the connection
+
+`OnConnectionEstablished` fires once, at the end of a successful start, when the
+connection is connected; it runs on the goroutine calling `Init`. It never fires
+again: a later connection is a restored one. When the connection is not
+connected at start, for example because the client is reconnecting, it does not
+fire, and `OnConnectionRestored` reports the connection when it comes back.
+
+`OnConnectionLost` fires each time the connection is lost, with the error the
+client reports (which may be `nil`), and `OnConnectionRestored` each time it is
+restored. `OnConnectionClosed` fires when the connection is closed for good
+while the server runs: the client gave up reconnecting, or someone closed it.
+These three run on the callback goroutine of the NATS client:
+
+```go
+server := natsserver.NewServer(nc, orderHandler).WithHooks(
+	natsserver.OnConnectionEstablished(func(nc *nats.Conn) { slog.Info("NATS connection established") }),
+	natsserver.OnConnectionLost(func(nc *nats.Conn, err error) { slog.Warn("NATS connection lost", "err", err) }),
+	natsserver.OnConnectionRestored(func(nc *nats.Conn) { slog.Info("NATS connection restored") }),
+	natsserver.OnConnectionClosed(func(nc *nats.Conn) { slog.Error("NATS connection closed") }),
+)
+```
+
+While it runs, the server owns the connection callbacks of the events its hooks
+watch. An `OnConnectionLost`, `OnConnectionRestored`, or `OnConnectionClosed`
+hook replaces the disconnect, reconnect, or closed callback you passed to
+`nats.Connect`: yours is neither chained nor restored. The callbacks of the
+events no hook watches are left untouched. `Shutdown` resets each callback the
+server installed to `nil`, so closing the connection after `app.Run` returns
+fires no hook. Give your connection callbacks through `WithHooks` rather than
+`nats.Connect`:
+
+```go
+nc, _ := nats.Connect(url,
+	nats.ClosedHandler(func(*nats.Conn) { fmt.Println("from nats.Connect") }),
+	nats.DisconnectErrHandler(func(*nats.Conn, error) { fmt.Println("from nats.Connect") }),
+)
+server := natsserver.NewServer(nc, orderHandler).WithHooks(
+	natsserver.OnConnectionClosed(func(*nats.Conn) { fmt.Println("from the hook") }),
+)
+_ = server.Init(ctx)
+// the closed callback is now the hook; the disconnect callback is still yours
+```
+
+#### Watching the subscriptions
+
+The server creates its subscriptions itself, so its hooks are the way to watch
+them. `OnSubscriptionOpened` fires each time the server opens a subscription,
+once per `HandleFunc` registration, in registration order:
+
+```go
+server := natsserver.NewServer(nc, orderHandler).WithHooks(
+	natsserver.OnSubscriptionOpened(func(nc *nats.Conn, sub *nats.Subscription) {
+		slog.Info("subscription opened", "subject", sub.Subject, "queue", sub.Queue)
+	}),
+)
+```
+
+It runs on the goroutine calling `Init`, while the server holds its lock, so it
+must not call any method of the server: that would deadlock.
+
+`OnSubscriptionClosed` fires once per subscription when it closes: during
+`Shutdown`, or when the connection closes. Every subscription reported opened
+is reported closed, even when the start fails: when a later subscription fails
+to open, the server closes the ones it already opened and reports each of them
+before `Init` returns the error. `Shutdown` waits for these hooks before it
+returns, as long as its context allows; when the context expires first,
+`Shutdown` fails and the server status becomes `StatusFailed`:
+
+```go
+server := natsserver.NewServer(nc, orderHandler).WithHooks(
+	natsserver.OnSubscriptionClosed(func(nc *nats.Conn, sub *nats.Subscription) {
+		slog.Info("subscription closed", "subject", sub.Subject)
+	}),
+)
+
+err := server.Shutdown(expiredCtx)
+// failed to wait for the NATS hooks: context deadline exceeded
+```
+
+`OnSubscriptionStatusChanged` fires on each status change of a subscription,
+such as `nats.SubscriptionSlowConsumer` when messages pile up faster than your
+handler takes them. Every subscription ends with `nats.SubscriptionClosed`,
+including when the connection closes. The initial `nats.SubscriptionActive` is
+not reported. The server watches each subscription on a goroutine of its own,
+and the NATS client drops the changes a slow hook did not take yet, so keep the
+hook fast or it may miss transitions:
+
+```go
+server := natsserver.NewServer(nc, orderHandler).WithHooks(
+	natsserver.OnSubscriptionStatusChanged(func(nc *nats.Conn, sub *nats.Subscription, status nats.SubStatus) {
+		slog.Info("subscription status changed", "subject", sub.Subject, "status", status)
+	}),
+)
+```
+
+#### Watching the handlers
+
+`OnHandlerFailed` fires each time a handler, wrapped in its middlewares, returns
+an error. It receives the connection, the message the handler failed to
+process, and the error, and the server keeps serving the next messages:
+
+```go
+server := natsserver.NewServer(nc, orderHandler).WithHooks(
+	natsserver.OnHandlerFailed(func(nc *nats.Conn, msg *nats.Msg, err error) {
+		slog.Error("failed to handle a message", "subject", msg.Subject, "err", err)
+	}),
+)
 ```
 
 ### Replying to requests
@@ -1232,7 +1535,7 @@ type TrackHandler struct{ publisher Publisher }
 func (h *TrackHandler) Handle(ctx context.Context, d udp.Datagram) error {
 	envelope, err := decode(d.Payload)
 	if err != nil {
-		return err // reported to OnError, the server keeps receiving
+		return err // reported to the OnHandlerFailed hooks, the server keeps receiving
 	}
 	return h.publisher.Publish(ctx, envelope)
 }
@@ -1249,17 +1552,8 @@ The context given to `Handle` carries the values of the `Init` context (a
 logger, a trace) but not its cancellation: it is canceled when the server shuts
 down, so a handler doing long work can stop early.
 
-The errors handlers return never stop the server. They are handed to the
-callback set with `OnError`, which you may call at any time, even while
-datagrams are being handled; without a callback they are dropped:
-
-```go
-server := udp.NewServer(config, &TrackHandler{publisher: nc})
-
-server.OnError(func(err error) {
-	slog.Error("failed to handle a datagram", "err", err)
-})
-```
+The errors handlers return never stop the server. They are reported to the
+`OnHandlerFailed` hooks described below, and dropped when there is none.
 
 The server does not log. Logging, tracing, or metrics belong to a handler of
 your own wrapping the next one, which the server cannot tell from any other
@@ -1274,6 +1568,40 @@ func WithLogging(logger *slog.Logger, next udp.Handler) udp.Handler {
 }
 
 server := udp.NewServer(config, WithLogging(logger, &TrackHandler{publisher: nc}))
+```
+
+### Hooking into the server lifecycle
+
+As on NATS, a hook is a callback you give the server with `WithHooks`, built
+with an `OnXxx` constructor of the `udp` package. `WithHooks` chains off
+`NewServer`, and you can call it several times: every hook is kept, and the
+hooks watching the same event run in the order you gave them. A `nil` callback
+is ignored. The hooks are installed when the server starts, so give them before
+`Init` or `resource.Run`: a hook added once the server started is ignored.
+
+#### Watching the handler
+
+`OnHandlerFailed` fires each time the handler returns an error. It receives the
+datagram the handler failed to process, with its source, and the error, and the
+server keeps serving the next datagrams:
+
+```go
+server := udp.NewServer(config, &TrackHandler{publisher: nc}).WithHooks(
+	udp.OnHandlerFailed(func(d udp.Datagram, err error) {
+		slog.Error("failed to handle a datagram", "source", d.Source, "err", err)
+	}),
+)
+```
+
+The hook runs on the goroutine reading the socket, before the next datagram is
+read, so it must not block, and it must not shut its own server down. It
+receives the very `Payload` slice the handler received, which the handler owns:
+copy it to keep it whenever the handler may modify it:
+
+```go
+udp.OnHandlerFailed(func(d udp.Datagram, err error) {
+	failed <- bytes.Clone(d.Payload) // the handler may reuse or modify the payload
+})
 ```
 
 ### The silence watchdog

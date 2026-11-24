@@ -99,7 +99,7 @@ func TestList(t *testing.T) {
 
 	t.Run("should publish the aggregate of the latest statuses when resources change concurrently", func(t *testing.T) {
 		// A refresh that publishes an aggregate computed before a concurrent change leaves it stale for good.
-		for iteration := 0; iteration < 2000; iteration++ {
+		for iteration := range 2000 {
 			c := resource.NewList()
 			degrading := fixture.NewHealthyFakeManaged("degrading")
 			failing := fixture.NewHealthyFakeManaged("failing")

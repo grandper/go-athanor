@@ -3,6 +3,7 @@ package nats_test
 import (
 	"context"
 	"errors"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -39,6 +40,141 @@ func TestServer(t *testing.T) {
 
 		assert.Equal(t, "orders-messages", server.Name())
 	})
+
+	t.Run("should return the same server from WithHooks", func(t *testing.T) {
+		server := natsserver.NewServer(fixture.ConnectToEmbeddedServer(t))
+
+		assert.Same(t, server, server.WithHooks(fixture.NewHookRecorder().Hooks()...))
+	})
+
+	t.Run("should keep the hooks of every WithHooks call", func(t *testing.T) {
+		nc := fixture.ConnectToEmbeddedServer(t)
+		first, second := fixture.NewHookRecorder(), fixture.NewHookRecorder()
+		handler := fixture.NewFakeHandler().
+			WithHandleFunc("orders.created", "", fixture.NewFakeHandlerFunc().FailWith(errors.New("boom")).Handle)
+		server := natsserver.NewServer(nc, handler).WithHooks(first.Hooks()...)
+		server.WithHooks(second.Hooks()...)
+		require.NoError(t, server.Init(ctx))
+
+		require.NoError(t, nc.Publish("orders.created", nil))
+
+		want := []string{
+			"subscription opened: orders.created",
+			"connection established",
+			"handler failed: orders.created: boom",
+		}
+		assert.Equal(t, want, first.WaitForEvents(t, 3))
+		assert.Equal(t, want, second.WaitForEvents(t, 3))
+	})
+
+	t.Run("should ignore the hooks added after Init", func(t *testing.T) {
+		nc := fixture.ConnectToEmbeddedServer(t)
+		early, late := fixture.NewHookRecorder(), fixture.NewHookRecorder()
+		handler := fixture.NewFakeHandler().
+			WithHandleFunc("orders.created", "", fixture.NewFakeHandlerFunc().FailWith(errors.New("boom")).Handle)
+		server := natsserver.NewServer(nc, handler).WithHooks(early.Hooks()...)
+		require.NoError(t, server.Init(ctx))
+
+		server.WithHooks(late.Hooks()...)
+		require.NoError(t, nc.Publish("orders.created", nil))
+		require.NoError(t, nc.Publish("orders.created", nil))
+
+		// The messages of a subscription are dispatched one after the other, so once the early hooks saw the
+		// second message, a late hook would have finished with the first one.
+		early.WaitForEvents(t, 4)
+		assert.Empty(t, late.Events(), "a hook added after Init must be ignored")
+	})
+
+	t.Run("should leave the nats.Connect callbacks untouched when no hook watches the connection", func(t *testing.T) {
+		callbacks := fixture.NewConnectCallbackRecorder()
+		natsServer := fixture.RunEmbeddedServer(t)
+		nc := fixture.ConnectTo(t, natsServer, append(callbacks.Options(), fixture.ReconnectQuickly())...)
+		server := natsserver.NewServer(nc).WithHooks(fixture.NewHookRecorder().HandlerFailedHook())
+		require.NoError(t, server.Init(ctx))
+
+		port := fixture.StopEmbeddedServer(t, natsServer)
+		callbacks.WaitForEvents(t, 1)
+		fixture.RunEmbeddedServerOnPort(t, port)
+		callbacks.WaitForEvents(t, 2)
+		nc.Close()
+
+		events := callbacks.WaitForEvents(t, 4)
+		assert.True(t, strings.HasPrefix(events[0], "disconnected: "), "unexpected event %q", events[0])
+		assert.Equal(t, []string{"reconnected", "disconnected: <nil>", "closed"}, events[1:])
+	})
+
+	t.Run("should replace the nats.Connect callback of each event a hook watches, and only those", func(t *testing.T) {
+		callbacks := fixture.NewConnectCallbackRecorder()
+		nc := fixture.ConnectToEmbeddedServer(t, callbacks.Options()...)
+		recorder := fixture.NewHookRecorder()
+		server := natsserver.NewServer(nc).WithHooks(recorder.ConnectionClosedHook())
+		require.NoError(t, server.Init(ctx))
+
+		nc.Close()
+
+		assert.Equal(t, []string{"connection closed"}, recorder.WaitForEvents(t, 1))
+		// The client calls the disconnect callback before the closed one, on the same goroutine.
+		assert.Equal(t, []string{"disconnected: <nil>"}, callbacks.Events(),
+			"the closed callback is replaced by the hook, while the disconnect callback is still called")
+	})
+
+	t.Run("should reset to nil the connection callbacks it installed when it shuts down", func(t *testing.T) {
+		callbacks := fixture.NewConnectCallbackRecorder()
+		nc := fixture.ConnectToEmbeddedServer(t, callbacks.Options()...)
+		recorder := fixture.NewHookRecorder()
+		server := natsserver.NewServer(nc).WithHooks(recorder.Hooks()...)
+		require.NoError(t, server.Init(ctx))
+
+		require.NoError(t, server.Shutdown(ctx))
+
+		assert.Nil(t, nc.DisconnectErrHandler())
+		assert.Nil(t, nc.ReconnectHandler())
+		assert.Nil(t, nc.ClosedHandler())
+	})
+
+	t.Run("should keep the nats.Connect callbacks it did not replace after it shuts down", func(t *testing.T) {
+		callbacks := fixture.NewConnectCallbackRecorder()
+		nc := fixture.ConnectToEmbeddedServer(t, callbacks.Options()...)
+		recorder := fixture.NewHookRecorder()
+		server := natsserver.NewServer(nc).WithHooks(recorder.ConnectionClosedHook())
+		require.NoError(t, server.Init(ctx))
+		require.NoError(t, server.Shutdown(ctx))
+
+		nc.Close()
+
+		assert.Equal(t, []string{"disconnected: <nil>"}, callbacks.WaitForEvents(t, 1))
+		assert.Nil(t, nc.ClosedHandler(), "the replaced closed callback is reset, not restored")
+		assert.Never(t, func() bool { return len(recorder.Events()) > 0 || len(callbacks.Events()) > 1 },
+			quietPeriod, 10*time.Millisecond)
+	})
+
+	t.Run("should leave the nats.Connect callbacks untouched when Init fails", func(t *testing.T) {
+		callbacks := fixture.NewConnectCallbackRecorder()
+		nc := fixture.ConnectToEmbeddedServer(t, callbacks.Options()...)
+		recorder := fixture.NewHookRecorder()
+		handler := fixture.NewFakeHandler().WithHandleFunc("orders created", "", fixture.NewFakeHandlerFunc().Handle)
+		server := natsserver.NewServer(nc, handler).WithHooks(recorder.Hooks()...)
+		require.ErrorIs(t, server.Init(ctx), nats.ErrBadSubject)
+
+		nc.Close()
+
+		assert.Equal(t, []string{"disconnected: <nil>", "closed"}, callbacks.WaitForEvents(t, 2))
+		assert.Empty(t, recorder.Events(), "a failed start installs no connection hook")
+	})
+
+	t.Run("should leave the nats.Connect callbacks untouched when shut down without having started",
+		func(t *testing.T) {
+			callbacks := fixture.NewConnectCallbackRecorder()
+			nc := fixture.ConnectToEmbeddedServer(t, callbacks.Options()...)
+			recorder := fixture.NewHookRecorder()
+			server := natsserver.NewServer(nc).WithHooks(recorder.Hooks()...)
+			require.NoError(t, server.Shutdown(ctx))
+
+			nc.Close()
+
+			assert.Equal(t, []string{"disconnected: <nil>", "closed"}, callbacks.WaitForEvents(t, 2))
+			assert.Empty(t, recorder.Events())
+		})
 
 	t.Run("should subscribe the registered handlers and report StatusHealthy", func(t *testing.T) {
 		nc := fixture.ConnectToEmbeddedServer(t)
@@ -159,6 +295,29 @@ func TestServer(t *testing.T) {
 		assert.Equal(t, resource.StatusFailed, server.Status().Get())
 	})
 
+	t.Run("should reset its connection callbacks even when a subscription cannot be canceled", func(t *testing.T) {
+		nc := fixture.ConnectToEmbeddedServer(t)
+		recorder := fixture.NewHookRecorder()
+		handler := fixture.NewFakeHandler().WithHandleFunc("orders.created", "", fixture.NewFakeHandlerFunc().Handle)
+		server := natsserver.NewServer(nc, handler).WithHooks(recorder.Hooks()...)
+		require.NoError(t, server.Init(ctx))
+		nc.Close()
+		// The closed connection closed the subscription: once its hook ran, every hook of the server is done.
+		require.Eventually(t, func() bool { return len(recorder.EventsContaining("subscription closed")) == 1 },
+			requestTimeout, 10*time.Millisecond)
+		shutdownCtx, cancel := context.WithTimeout(ctx, requestTimeout)
+		defer cancel()
+
+		err := server.Shutdown(shutdownCtx)
+
+		require.ErrorIs(t, err, nats.ErrConnectionClosed, "the unsubscribe error is what Shutdown reports")
+		require.NotErrorIs(t, err, context.DeadlineExceeded, "no hook is left to wait for")
+		assert.Equal(t, resource.StatusFailed, server.Status().Get())
+		assert.Nil(t, nc.DisconnectErrHandler())
+		assert.Nil(t, nc.ReconnectHandler())
+		assert.Nil(t, nc.ClosedHandler())
+	})
+
 	t.Run("should report StatusClosed when Init was never called", func(t *testing.T) {
 		server := natsserver.NewServer(fixture.ConnectToEmbeddedServer(t))
 
@@ -268,26 +427,26 @@ func TestServer(t *testing.T) {
 		assert.ErrorIs(t, requestCtx.Err(), context.Canceled)
 	})
 
-	t.Run("should let the error handler change while messages are dispatched", func(t *testing.T) {
+	t.Run("should let hooks be added while messages are dispatched", func(t *testing.T) {
 		const messageCount = 100
 		nc := fixture.ConnectToEmbeddedServer(t)
-		server := natsserver.NewServer(nc)
+		server := natsserver.NewServer(nc).WithHooks(fixture.NewHookRecorder().Hooks()...)
 		handler := fixture.NewFakeHandlerFunc().FailWith(errors.New("boom"))
 		require.NoError(t, server.HandleFunc("orders.created", "", handler.Handle))
 		require.NoError(t, server.ListenAndServe())
 
-		// The race detector fails the test when the dispatch reads the error handler without synchronization.
+		// The race detector fails the test when the dispatch reads the hooks without synchronization.
 		var group sync.WaitGroup
 		group.Add(2)
 		go func() {
 			defer group.Done()
-			for i := 0; i < messageCount; i++ {
-				server.OnError(func(error) {})
+			for range messageCount {
+				server.WithHooks(fixture.NewHookRecorder().Hooks()...)
 			}
 		}()
 		go func() {
 			defer group.Done()
-			for i := 0; i < messageCount; i++ {
+			for range messageCount {
 				assert.NoError(t, nc.Publish("orders.created", nil))
 			}
 		}()

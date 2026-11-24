@@ -36,7 +36,8 @@ type Server struct {
 	status   *resource.ObservableStatus
 
 	mu         sync.Mutex
-	started    bool // claimed by the first successful Init, for good
+	started    bool     // claimed by the first successful Init, for good
+	hooks      *hookSet // frozen once started, so the hooks run without the mutex
 	grpcServer *grpc.Server
 	done       chan struct{} // closed when the serve goroutine exits
 	serveErr   error         // first unexpected serve error, read by Shutdown
@@ -49,6 +50,7 @@ func NewServer(config *Config, handlers ...Handler) *Server {
 		config:   config,
 		handlers: handlers,
 		status:   resource.NewObservableStatus(resource.StatusInitializing),
+		hooks:    &hookSet{},
 	}
 }
 
@@ -62,6 +64,18 @@ func (s *Server) WithName(name string) *Server {
 // The server owns the listener from then on and closes it when it stops serving.
 func (s *Server) WithListener(listener net.Listener) *Server {
 	s.listener = listener
+	return s
+}
+
+// WithHooks adds hooks watching the lifecycle of the server. You can call it several times: every hook is kept,
+// and the hooks watching the same event run in the order they were given. The hooks are installed when the server
+// starts, so hooks added after the server started are ignored.
+func (s *Server) WithHooks(hooks ...Hook) *Server {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if !s.started {
+		s.hooks.add(hooks...)
+	}
 	return s
 }
 
@@ -91,7 +105,7 @@ func (s *Server) Init(ctx context.Context) error {
 // start registers the handlers, binds the listener, and serves in the background.
 func (s *Server) start(ctx context.Context) error {
 	// Register before binding, so a failed registration leaves no listener behind.
-	grpcServer := grpc.NewServer()
+	grpcServer := grpc.NewServer(s.hooks.serverOptions()...)
 	for _, handler := range s.handlers {
 		if err := handler.Register(grpcServer); err != nil {
 			return fmt.Errorf("failed to register a gRPC handler: %w", err)
