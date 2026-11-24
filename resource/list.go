@@ -40,16 +40,26 @@ type List struct {
 	failedCancel context.CancelCauseFunc
 }
 
-// NewList returns an empty List ready for [List.Register].
-func NewList() *List {
+// NewList returns a List managing the given resources in order. It computes the aggregate status once for all
+// of them, rather than once per [List.Register] call. It fails when two resources share a name.
+func NewList(resources ...Managed) (*List, error) {
 	failedCtx, failedCancel := context.WithCancelCause(context.Background())
-	return &List{
-		resources:    make(map[string]Managed),
+	l := &List{
+		resources:    make(map[string]Managed, len(resources)),
+		order:        make([]string, 0, len(resources)),
 		unsubscribe:  make(map[string]func()),
 		status:       NewObservableStatus(StatusInitializing),
 		failedCtx:    failedCtx,
 		failedCancel: failedCancel,
 	}
+	for _, r := range resources {
+		if err := l.add(r); err != nil {
+			failedCancel(nil)
+			return nil, err
+		}
+	}
+	l.refreshStatus()
+	return l, nil
 }
 
 // Name returns the name of the List.
@@ -59,22 +69,27 @@ func (l *List) Name() string {
 
 // Register adds a managed resource to the List, failing if its name is already registered.
 func (l *List) Register(r Managed) error {
+	if err := l.add(r); err != nil {
+		return err
+	}
+	l.refreshStatus()
+	return nil
+}
+
+// add appends a resource to the List without publishing the aggregate status.
+func (l *List) add(r Managed) error {
 	name := r.Name()
 
 	l.mu.Lock()
+	defer l.mu.Unlock()
 	if l.initialized {
-		l.mu.Unlock()
 		return fmt.Errorf("failed to register resource %q: %w", name, ErrListAlreadyInitialized)
 	}
 	if _, exists := l.resources[name]; exists {
-		l.mu.Unlock()
 		return fmt.Errorf("failed to register resource %q: %w", name, ErrAlreadyRegistered)
 	}
 	l.resources[name] = r
 	l.order = append(l.order, name)
-	l.mu.Unlock()
-
-	l.refreshStatus()
 	return nil
 }
 

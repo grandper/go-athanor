@@ -57,9 +57,15 @@ func TestHookRecorder(t *testing.T) {
 
 	t.Run("should record a failure with its method and gRPC code", func(t *testing.T) {
 		recorder := fixture.NewHookRecorder()
-		client := serveWithHooks(t, grpcserver.NewHealthHandler(resource.NewList()), recorder.HandlerFailedHook())
+		resources, err := resource.NewList()
+		require.NoError(t, err)
+		client := serveWithHooks(
+			t,
+			grpcserver.NewHealthHandler(resources),
+			recorder.HandlerFailedHook(),
+		)
 
-		err := check(client, "orders")
+		err = check(client, "orders")
 
 		require.Equal(t, codes.NotFound, status.Code(err))
 		assert.Equal(t, []string{"handler failed: /grpc.health.v1.Health/Check: NotFound"}, recorder.Events())
@@ -87,7 +93,9 @@ func TestHookRecorder(t *testing.T) {
 
 	t.Run("should prefix the events of labeled hooks with their label", func(t *testing.T) {
 		recorder := fixture.NewHookRecorder()
-		client := serveWithHooks(t, grpcserver.NewHealthHandler(resource.NewList()),
+		resources, err := resource.NewList()
+		require.NoError(t, err)
+		client := serveWithHooks(t, grpcserver.NewHealthHandler(resources),
 			append(recorder.HooksLabeled("first"), recorder.HooksLabeled("second")...)...)
 
 		_ = check(client, "orders")
@@ -112,7 +120,13 @@ func TestHookRecorder(t *testing.T) {
 
 	t.Run("should wait for the events reported after the response", func(t *testing.T) {
 		recorder := fixture.NewHookRecorder()
-		client := serveWithHooks(t, grpcserver.NewHealthHandler(resource.NewList()), recorder.HandlerFailedHook())
+		resources, err := resource.NewList()
+		require.NoError(t, err)
+		client := serveWithHooks(
+			t,
+			grpcserver.NewHealthHandler(resources),
+			recorder.HandlerFailedHook(),
+		)
 		ctx, cancel := context.WithCancel(context.Background())
 		stream, err := client.Watch(ctx, &grpc_health_v1.HealthCheckRequest{})
 		require.NoError(t, err)
@@ -127,7 +141,13 @@ func TestHookRecorder(t *testing.T) {
 
 	t.Run("should return a snapshot of the events", func(t *testing.T) {
 		recorder := fixture.NewHookRecorder()
-		client := serveWithHooks(t, grpcserver.NewHealthHandler(resource.NewList()), recorder.HandlerFailedHook())
+		resources, err := resource.NewList()
+		require.NoError(t, err)
+		client := serveWithHooks(
+			t,
+			grpcserver.NewHealthHandler(resources),
+			recorder.HandlerFailedHook(),
+		)
 		_ = check(client, "orders")
 		events := recorder.Events()
 
@@ -140,7 +160,9 @@ func TestHookRecorder(t *testing.T) {
 		func(t *testing.T) {
 			recorder := fixture.NewHookRecorder()
 			listener := athanorfixture.ListenOnFreePort(t)
-			server := grpcserver.NewServer(&grpcserver.Config{}, grpcserver.NewHealthHandler(resource.NewList())).
+			resources, err := resource.NewList()
+			require.NoError(t, err)
+			server := grpcserver.NewServer(&grpcserver.Config{}, grpcserver.NewHealthHandler(resources)).
 				WithListener(listener).
 				WithHooks(recorder.ConnectionEstablishedHook(), recorder.ConnectionClosedHook())
 			require.NoError(t, server.Init(context.Background()))
@@ -159,7 +181,9 @@ func TestHookRecorder(t *testing.T) {
 
 	t.Run("should record the statistics events of a request with their type", func(t *testing.T) {
 		recorder := fixture.NewHookRecorder()
-		client := serveWithHooks(t, grpcserver.NewHealthHandler(resource.NewList()),
+		resources, err := resource.NewList()
+		require.NoError(t, err)
+		client := serveWithHooks(t, grpcserver.NewHealthHandler(resources),
 			recorder.RequestStatsReportedHook())
 
 		require.NoError(t, check(client, ""))
@@ -172,7 +196,9 @@ func TestHookRecorder(t *testing.T) {
 
 	t.Run("should wait for the events containing a text", func(t *testing.T) {
 		recorder := fixture.NewHookRecorder()
-		client := serveWithHooks(t, grpcserver.NewHealthHandler(resource.NewList()), recorder.Hooks()...)
+		resources, err := resource.NewList()
+		require.NoError(t, err)
+		client := serveWithHooks(t, grpcserver.NewHealthHandler(resources), recorder.Hooks()...)
 
 		_ = check(client, "orders")
 

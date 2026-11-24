@@ -77,9 +77,8 @@ func TestHealthHandler(t *testing.T) {
 	ctx := context.Background()
 
 	t.Run("should report the server as serving when all resources are operational", func(t *testing.T) {
-		resources := resource.NewList()
-		require.NoError(t, resources.Register(fixture.NewHealthyFakeManaged("db")))
-		require.NoError(t, resources.Register(fixture.NewHealthyFakeManaged("nats")))
+		resources, err := resource.NewList(fixture.NewHealthyFakeManaged("db"), fixture.NewHealthyFakeManaged("nats"))
+		require.NoError(t, err)
 		require.NoError(t, resources.Init(ctx))
 		client := startHealthServer(t, grpcserver.NewHealthHandler(resources))
 
@@ -90,10 +89,9 @@ func TestHealthHandler(t *testing.T) {
 	})
 
 	t.Run("should report the server as not serving when a resource is not operational", func(t *testing.T) {
-		resources := resource.NewList()
 		db := fixture.NewHealthyFakeManaged("db")
-		require.NoError(t, resources.Register(db))
-		require.NoError(t, resources.Register(fixture.NewHealthyFakeManaged("nats")))
+		resources, err := resource.NewList(db, fixture.NewHealthyFakeManaged("nats"))
+		require.NoError(t, err)
 		require.NoError(t, resources.Init(ctx))
 		db.Notify(resource.StatusUnhealthy)
 		client := startHealthServer(t, grpcserver.NewHealthHandler(resources))
@@ -105,7 +103,9 @@ func TestHealthHandler(t *testing.T) {
 	})
 
 	t.Run("should report the server as serving for a list with no resources", func(t *testing.T) {
-		client := startHealthServer(t, grpcserver.NewHealthHandler(resource.NewList()))
+		resources, err := resource.NewList()
+		require.NoError(t, err)
+		client := startHealthServer(t, grpcserver.NewHealthHandler(resources))
 
 		response, err := checkHealth(t, client, "")
 
@@ -114,10 +114,9 @@ func TestHealthHandler(t *testing.T) {
 	})
 
 	t.Run("should report every resource as a service named after it", func(t *testing.T) {
-		resources := resource.NewList()
 		db := fixture.NewHealthyFakeManaged("db")
-		require.NoError(t, resources.Register(db))
-		require.NoError(t, resources.Register(fixture.NewHealthyFakeManaged("nats")))
+		resources, err := resource.NewList(db, fixture.NewHealthyFakeManaged("nats"))
+		require.NoError(t, err)
 		require.NoError(t, resources.Init(ctx))
 		db.Notify(resource.StatusUnhealthy)
 		client := startHealthServer(t, grpcserver.NewHealthHandler(resources))
@@ -132,17 +131,19 @@ func TestHealthHandler(t *testing.T) {
 	})
 
 	t.Run("fails the check for an unknown service", func(t *testing.T) {
-		client := startHealthServer(t, grpcserver.NewHealthHandler(resource.NewList()))
+		resources, err := resource.NewList()
+		require.NoError(t, err)
+		client := startHealthServer(t, grpcserver.NewHealthHandler(resources))
 
-		_, err := checkHealth(t, client, "unknown-service")
+		_, err = checkHealth(t, client, "unknown-service")
 
 		assert.Equal(t, codes.NotFound, status.Code(err))
 	})
 
 	t.Run("should stream the health of the server to a watcher whenever it changes", func(t *testing.T) {
-		resources := resource.NewList()
 		db := fixture.NewHealthyFakeManaged("db")
-		require.NoError(t, resources.Register(db))
+		resources, err := resource.NewList(db)
+		require.NoError(t, err)
 		require.NoError(t, resources.Init(ctx))
 		client := startHealthServer(t, grpcserver.NewHealthHandler(resources))
 
@@ -156,9 +157,9 @@ func TestHealthHandler(t *testing.T) {
 	})
 
 	t.Run("should only stream the changes of the serving status", func(t *testing.T) {
-		resources := resource.NewList()
 		db := fixture.NewHealthyFakeManaged("db")
-		require.NoError(t, resources.Register(db))
+		resources, err := resource.NewList(db)
+		require.NoError(t, err)
 		require.NoError(t, resources.Init(ctx))
 		client := startHealthServer(t, grpcserver.NewHealthHandler(resources))
 
@@ -171,9 +172,9 @@ func TestHealthHandler(t *testing.T) {
 	})
 
 	t.Run("should stream the health of a single resource to a watcher", func(t *testing.T) {
-		resources := resource.NewList()
 		db := fixture.NewHealthyFakeManaged("db")
-		require.NoError(t, resources.Register(db))
+		resources, err := resource.NewList(db)
+		require.NoError(t, err)
 		require.NoError(t, resources.Init(ctx))
 		client := startHealthServer(t, grpcserver.NewHealthHandler(resources))
 
@@ -185,7 +186,9 @@ func TestHealthHandler(t *testing.T) {
 	})
 
 	t.Run("should stream SERVICE_UNKNOWN to the watcher of an unknown service", func(t *testing.T) {
-		client := startHealthServer(t, grpcserver.NewHealthHandler(resource.NewList()))
+		resources, err := resource.NewList()
+		require.NoError(t, err)
+		client := startHealthServer(t, grpcserver.NewHealthHandler(resources))
 
 		stream := watchHealth(t, client, "unknown-service")
 
@@ -193,7 +196,9 @@ func TestHealthHandler(t *testing.T) {
 	})
 
 	t.Run("should end the stream when the watcher leaves", func(t *testing.T) {
-		client := startHealthServer(t, grpcserver.NewHealthHandler(resource.NewList()))
+		resources, err := resource.NewList()
+		require.NoError(t, err)
+		client := startHealthServer(t, grpcserver.NewHealthHandler(resources))
 		watchCtx, cancel := context.WithCancel(ctx)
 		stream, err := client.Watch(watchCtx, &grpc_health_v1.HealthCheckRequest{})
 		require.NoError(t, err)
@@ -208,7 +213,9 @@ func TestHealthHandler(t *testing.T) {
 	t.Run("should end the stream when the status cannot be sent", func(t *testing.T) {
 		stream := grpcfixture.NewFakeHealthWatchStream(ctx).FailSendWith(errors.New("send failed"))
 
-		err := grpcserver.NewHealthHandler(resource.NewList()).Watch(&grpc_health_v1.HealthCheckRequest{}, stream)
+		resources, err := resource.NewList()
+		require.NoError(t, err)
+		err = grpcserver.NewHealthHandler(resources).Watch(&grpc_health_v1.HealthCheckRequest{}, stream)
 
 		assert.Equal(t, codes.Canceled, status.Code(err))
 	})

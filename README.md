@@ -387,16 +387,17 @@ Only the owning resource calls `Set`.
 
 ### Managing resources with a List
 
-To manage resources as a group, register them on a `List`. The List initializes
-resources in registration order and shuts them down in reverse order. When a
-resource fails to initialize, the already-started resources are rolled back
-automatically:
+To manage resources as a group, create a `List` from them with `NewList`. The
+List initializes resources in the order you gave them and shuts them down in
+reverse order. When a resource fails to initialize, the already-started
+resources are rolled back automatically. Names are unique within a List, so
+`NewList` fails with `resource.ErrAlreadyRegistered` when two resources share a
+name:
 
 ```go
-resources := resource.NewList()
-
-if err := resources.Register(newDatabase()); err != nil {
-	return err // resource.ErrAlreadyRegistered: the name is already taken
+resources, err := resource.NewList(newDatabase(), newCache())
+if err != nil {
+	return err // resource.ErrAlreadyRegistered: two resources share a name
 }
 
 if err := resources.Init(ctx); err != nil {
@@ -410,12 +411,26 @@ bounded to 30 seconds, which keeps the values of the `Init` context but not its
 cancellation: an `Init` interrupted by a canceled context still gets a proper
 cleanup.
 
+#### Registering a resource later
+
+You can also add a resource to an existing List with `Register`, which appends
+it after the others. This is how you add a resource that needs the List itself,
+such as a server exposing [the health of the List](#exposing-the-health-of-your-resources).
+Prefer handing every other resource to `NewList`: the List then computes its
+aggregate status once for all of them, instead of once per `Register` call.
+
+```go
+if err := resources.Register(newQueue()); err != nil {
+	return err // resource.ErrAlreadyRegistered: the name is already taken
+}
+```
+
 `Init` closes the registration. A resource registered later would never be
 initialized nor observed, so `Register` refuses it with
 `resource.ErrListAlreadyInitialized`:
 
 ```go
-err := resources.Register(newCache()) // after Init
+err := resources.Register(newMetrics()) // after Init
 errors.Is(err, resource.ErrListAlreadyInitialized) // true
 ```
 
@@ -474,8 +489,8 @@ func serve(ctx context.Context) error {
 ### The aggregate status of a List
 
 A List is itself a `Managed` resource: `Status()` returns the List's own
-observable status, re-derived from the resources' statuses when a resource is
-registered, and then whenever one of them changes from `Init` until `Shutdown`.
+observable status, re-derived from the resources' statuses when the List is
+created and when a resource is registered, and then whenever one of them changes from `Init` until `Shutdown`.
 Resources may change concurrently: the aggregate always settles on the latest
 statuses, and an observer of the aggregate may itself change a resource.
 The rules, in decreasing order of severity:
@@ -725,11 +740,13 @@ a List you hold, so build the List yourself and register it on `app.Run` as one
 composite resource:
 
 ```go
-resources := resource.NewList()
-_ = resources.Register(databasePool)
+resources, err := resource.NewList(databasePool)
+if err != nil {
+	return err
+}
 _ = resources.Register(httpserver.NewServer(config, httpserver.NewHealthHandler(resources)))
 
-err := app.Run(ctx,
+err = app.Run(ctx,
 	app.WithResource(resources), // one composite resource
 	app.WithProcess(process.ListenToSignals),
 )
@@ -854,13 +871,16 @@ The `resource/server/grpc` package is the gRPC counterpart of the HTTP server.
 and its handlers:
 
 ```go
-resources := resource.NewList()
+resources, err := resource.NewList()
+if err != nil {
+	return err
+}
 _ = resources.Register(grpcserver.NewServer(config,
 	grpcserver.NewHealthHandler(resources),
 	&accountServiceHandler{},
 ))
 
-err := app.Run(ctx, app.WithResource(resources))
+err = app.Run(ctx, app.WithResource(resources))
 ```
 
 `Init` registers the handlers, binds the listener, and serves in the
@@ -956,8 +976,10 @@ Like its [HTTP counterpart](#exposing-the-health-of-your-resources) it is built
 from a List you hold, and it reads the statuses of the List on every call:
 
 ```go
-resources := resource.NewList()
-_ = resources.Register(databasePool)
+resources, err := resource.NewList(databasePool)
+if err != nil {
+	return err
+}
 _ = resources.Register(grpcserver.NewServer(config, grpcserver.NewHealthHandler(resources)))
 ```
 
@@ -1352,8 +1374,10 @@ built from a List you hold, it replies with the same JSON body, and with the
 otherwise:
 
 ```go
-resources := resource.NewList()
-_ = resources.Register(databasePool)
+resources, err := resource.NewList(databasePool)
+if err != nil {
+	return err
+}
 _ = resources.Register(natsserver.NewServer(nc, natsserver.NewHealthHandler(resources)))
 ```
 

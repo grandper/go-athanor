@@ -3,13 +3,9 @@ package fixture
 import (
 	"fmt"
 	"time"
-)
 
-// TestingT is the subset of *testing.T needed by the helpers that fail the test on their own.
-type TestingT interface {
-	Helper()
-	Fatalf(format string, args ...any)
-}
+	"github.com/stretchr/testify/require"
+)
 
 // Receive returns the next value received from ch, or fails the test with the formatted message when nothing
 // arrives within timeout. A closed channel counts as an arrival, so it also waits for a done channel.
@@ -23,10 +19,10 @@ func Receive[T any](t TestingT, ch <-chan T, timeout time.Duration, format strin
 	case value := <-ch:
 		return value
 	case <-timer.C:
-		t.Fatalf("%s (nothing received within %s)", fmt.Sprintf(format, args...), timeout)
+		require.FailNowf(t, fmt.Sprintf(format, args...), "nothing received within %s", timeout)
 	}
 
-	// Only reached with a TestingT whose Fatalf returns.
+	// Only reached with a TestingT whose FailNow returns.
 	var zero T
 	return zero
 }

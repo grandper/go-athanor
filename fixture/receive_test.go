@@ -1,8 +1,6 @@
 package fixture_test
 
 import (
-	"fmt"
-	"runtime"
 	"testing"
 	"time"
 
@@ -11,21 +9,6 @@ import (
 
 	"github.com/grandper/go-athanor/fixture"
 )
-
-// fatalRecorder is a fixture.TestingT recording the fatal failure instead of failing the running test.
-type fatalRecorder struct {
-	message string
-	returns bool // makes Fatalf return instead of stopping the goroutine
-}
-
-func (r *fatalRecorder) Helper() {}
-
-func (r *fatalRecorder) Fatalf(format string, args ...any) {
-	r.message = fmt.Sprintf(format, args...)
-	if !r.returns {
-		runtime.Goexit() // stops the calling goroutine, as testing.T does
-	}
-}
 
 func TestReceive(t *testing.T) {
 	t.Run("should return the value sent on the channel", func(t *testing.T) {
@@ -52,7 +35,7 @@ func TestReceive(t *testing.T) {
 	})
 
 	t.Run("fails the test with the message when nothing arrives in time", func(t *testing.T) {
-		recorder := &fatalRecorder{}
+		recorder := fixture.NewFailureRecorder()
 		finished := make(chan struct{})
 		go func() {
 			defer close(finished)
@@ -61,16 +44,16 @@ func TestReceive(t *testing.T) {
 		}()
 
 		fixture.Receive(t, finished, time.Second, "Receive never gave up")
-		require.Contains(t, recorder.message, "Run did not return after the cancel")
-		assert.Contains(t, recorder.message, "10ms")
+		require.Contains(t, recorder.Message(), "Run did not return after the cancel")
+		assert.Contains(t, recorder.Message(), "10ms")
 	})
 
 	t.Run("should return the zero value when the failure does not stop the goroutine", func(t *testing.T) {
-		recorder := &fatalRecorder{returns: true}
+		recorder := fixture.NewFailureRecorder().ReturnFromFailNow()
 
 		value := fixture.Receive(recorder, make(chan int), 10*time.Millisecond, "nothing was sent")
 
-		assert.NotEmpty(t, recorder.message)
+		assert.NotEmpty(t, recorder.Message())
 		assert.Zero(t, value)
 	})
 }

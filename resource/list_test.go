@@ -26,11 +26,41 @@ func statusOf(t *testing.T, c *resource.List, name string) resource.Status {
 func TestList(t *testing.T) {
 	ctx := context.Background()
 
-	t.Run("should reject a resource registered twice under the same name", func(t *testing.T) {
-		c := resource.NewList()
-		require.NoError(t, c.Register(fixture.NewFakeManaged("a")))
+	t.Run("should manage the resources given at creation", func(t *testing.T) {
+		c, err := resource.NewList(fixture.NewHealthyFakeManaged("a"), fixture.NewHealthyFakeManaged("b"))
+		require.NoError(t, err)
 
-		err := c.Register(fixture.NewFakeManaged("a"))
+		require.NoError(t, c.Init(ctx))
+
+		assert.Equal(t, map[string]resource.Status{
+			"a": resource.StatusHealthy,
+			"b": resource.StatusHealthy,
+		}, c.StatusSummary())
+	})
+
+	t.Run("should aggregate the statuses of the resources given at creation", func(t *testing.T) {
+		r := fixture.NewFakeManaged("a")
+		r.Notify(resource.StatusHealthy)
+
+		c, err := resource.NewList(r)
+
+		require.NoError(t, err)
+		assert.Equal(t, resource.StatusHealthy, c.Status().Get())
+	})
+
+	t.Run("fails to create a List from two resources under the same name", func(t *testing.T) {
+		c, err := resource.NewList(fixture.NewFakeManaged("a"), fixture.NewFakeManaged("a"))
+
+		require.ErrorIs(t, err, resource.ErrAlreadyRegistered)
+		require.ErrorContains(t, err, `failed to register resource "a"`)
+		assert.Nil(t, c)
+	})
+
+	t.Run("should reject a resource registered twice under the same name", func(t *testing.T) {
+		c, err := resource.NewList(fixture.NewFakeManaged("a"))
+		require.NoError(t, err)
+
+		err = c.Register(fixture.NewFakeManaged("a"))
 
 		require.ErrorIs(t, err, resource.ErrAlreadyRegistered)
 		require.ErrorContains(t, err, `"a"`)
@@ -39,14 +69,14 @@ func TestList(t *testing.T) {
 
 	t.Run("should initialize a resource that sets its status synchronously from Init", func(t *testing.T) {
 		// The List must not hold its lock across Init.
-		c := resource.NewList()
 		r := fixture.NewHealthyFakeManaged("nats")
-		require.NoError(t, c.Register(r))
+		c, err := resource.NewList(r)
+		require.NoError(t, err)
 
 		done := make(chan error, 1)
 		go func() { done <- c.Init(ctx) }()
 
-		err := athanorfixture.Receive(t, done, 2*time.Second, "Init deadlocked on synchronous status change")
+		err = athanorfixture.Receive(t, done, 2*time.Second, "Init deadlocked on synchronous status change")
 		require.NoError(t, err)
 
 		assert.Equal(t, resource.StatusHealthy, statusOf(t, c, "nats"))
@@ -54,12 +84,11 @@ func TestList(t *testing.T) {
 	})
 
 	t.Run("should roll back the already-started resources when a later Init fails", func(t *testing.T) {
-		c := resource.NewList()
 		good := fixture.NewHealthyFakeManaged("good")
 		errBoom := errors.New("boom")
 		bad := fixture.NewFakeManaged("bad").FailInitWith(errBoom)
-		require.NoError(t, c.Register(good))
-		require.NoError(t, c.Register(bad))
+		c, err := resource.NewList(good, bad)
+		require.NoError(t, err)
 
 		require.ErrorIs(t, c.Init(ctx), errBoom)
 
@@ -70,11 +99,10 @@ func TestList(t *testing.T) {
 	})
 
 	t.Run("should roll back with a live context when the Init context is already canceled", func(t *testing.T) {
-		c := resource.NewList()
 		good := fixture.NewHealthyFakeManaged("good")
 		bad := fixture.NewFakeManaged("bad").FailInitWith(errors.New("boom"))
-		require.NoError(t, c.Register(good))
-		require.NoError(t, c.Register(bad))
+		c, err := resource.NewList(good, bad)
+		require.NoError(t, err)
 		canceledCtx, cancel := context.WithCancel(ctx)
 		cancel()
 
@@ -85,11 +113,11 @@ func TestList(t *testing.T) {
 	})
 
 	t.Run("fails to register a resource once Init was called", func(t *testing.T) {
-		c := resource.NewList()
-		require.NoError(t, c.Register(fixture.NewHealthyFakeManaged("database")))
+		c, err := resource.NewList(fixture.NewHealthyFakeManaged("database"))
+		require.NoError(t, err)
 		require.NoError(t, c.Init(ctx))
 
-		err := c.Register(fixture.NewFakeManaged("late"))
+		err = c.Register(fixture.NewFakeManaged("late"))
 
 		require.ErrorIs(t, err, resource.ErrListAlreadyInitialized)
 		require.ErrorContains(t, err, `failed to register resource "late"`)
@@ -100,11 +128,10 @@ func TestList(t *testing.T) {
 	t.Run("should publish the aggregate of the latest statuses when resources change concurrently", func(t *testing.T) {
 		// A refresh that publishes an aggregate computed before a concurrent change leaves it stale for good.
 		for iteration := range 2000 {
-			c := resource.NewList()
 			degrading := fixture.NewHealthyFakeManaged("degrading")
 			failing := fixture.NewHealthyFakeManaged("failing")
-			require.NoError(t, c.Register(degrading))
-			require.NoError(t, c.Register(failing))
+			c, err := resource.NewList(degrading, failing)
+			require.NoError(t, err)
 			require.NoError(t, c.Init(ctx))
 
 			var group sync.WaitGroup
@@ -118,11 +145,10 @@ func TestList(t *testing.T) {
 	})
 
 	t.Run("should let an observer of the aggregate change a resource without deadlocking", func(t *testing.T) {
-		c := resource.NewList()
 		first := fixture.NewHealthyFakeManaged("first")
 		second := fixture.NewHealthyFakeManaged("second")
-		require.NoError(t, c.Register(first))
-		require.NoError(t, c.Register(second))
+		c, err := resource.NewList(first, second)
+		require.NoError(t, err)
 		require.NoError(t, c.Init(ctx))
 		// Observers run synchronously inside the refresh, so this one re-enters it.
 		unsubscribe := c.Status().Observe(resource.StatusObserverFunc(func(s resource.Status) {
@@ -140,9 +166,9 @@ func TestList(t *testing.T) {
 	})
 
 	t.Run("should return the failure cause from Manage when a resource fails", func(t *testing.T) {
-		c := resource.NewList()
 		r := fixture.NewHealthyFakeManaged("nats")
-		require.NoError(t, c.Register(r))
+		c, err := resource.NewList(r)
+		require.NoError(t, err)
 		require.NoError(t, c.Init(ctx))
 
 		errCh := make(chan error, 1)
@@ -151,7 +177,7 @@ func TestList(t *testing.T) {
 		// Manage waits on signals that stay raised, so the outcome is the same whether or not it already blocks.
 		r.Notify(resource.StatusFailed)
 
-		err := athanorfixture.Receive(t, errCh, 2*time.Second, "Manage did not return after StatusFailed")
+		err = athanorfixture.Receive(t, errCh, 2*time.Second, "Manage did not return after StatusFailed")
 		require.ErrorIs(t, err, resource.ErrResourceFailed)
 		require.ErrorContains(t, err, `"nats"`)
 
@@ -160,9 +186,9 @@ func TestList(t *testing.T) {
 	})
 
 	t.Run("should return from Manage when the context is canceled", func(t *testing.T) {
-		c := resource.NewList()
 		r := fixture.NewHealthyFakeManaged("nats")
-		require.NoError(t, c.Register(r))
+		c, err := resource.NewList(r)
+		require.NoError(t, err)
 		require.NoError(t, c.Init(ctx))
 
 		cancelCtx, cancel := context.WithCancel(ctx)
@@ -171,24 +197,25 @@ func TestList(t *testing.T) {
 
 		cancel()
 
-		err := athanorfixture.Receive(t, errCh, 2*time.Second, "Manage did not return after context cancel")
+		err = athanorfixture.Receive(t, errCh, 2*time.Second, "Manage did not return after context cancel")
 		require.ErrorIs(t, err, context.Canceled)
 	})
 
 	t.Run("should return from Manage on context cancellation when no resource is registered", func(t *testing.T) {
-		c := resource.NewList()
+		c, err := resource.NewList()
+		require.NoError(t, err)
 		cancelCtx, cancel := context.WithCancel(ctx)
 		errCh := make(chan error, 1)
 		go func() { errCh <- c.Manage(cancelCtx) }()
 		cancel()
-		err := athanorfixture.Receive(t, errCh, time.Second, "Manage with no resources did not return")
+		err = athanorfixture.Receive(t, errCh, time.Second, "Manage with no resources did not return")
 		require.ErrorIs(t, err, context.Canceled)
 	})
 
 	t.Run("should not report a failure to Manage on a clean Shutdown", func(t *testing.T) {
-		c := resource.NewList()
 		r := fixture.NewHealthyFakeManaged("nats")
-		require.NoError(t, c.Register(r))
+		c, err := resource.NewList(r)
+		require.NoError(t, err)
 		require.NoError(t, c.Init(ctx))
 
 		errCh := make(chan error, 1)
@@ -199,12 +226,13 @@ func TestList(t *testing.T) {
 		assert.Equal(t, resource.StatusClosed, statusOf(t, c, "nats"))
 		assert.Equal(t, resource.StatusClosed, c.Status().Get())
 
-		err := athanorfixture.Receive(t, errCh, 2*time.Second, "Manage did not return after Shutdown")
+		err = athanorfixture.Receive(t, errCh, 2*time.Second, "Manage did not return after Shutdown")
 		require.NoError(t, err, "Manage should return nil after a clean Shutdown")
 	})
 
 	t.Run("should stay in StatusInitializing when it is empty, even once shut down", func(t *testing.T) {
-		c := resource.NewList()
+		c, err := resource.NewList()
+		require.NoError(t, err)
 		require.NoError(t, c.Init(ctx))
 
 		require.NoError(t, c.Shutdown(ctx))
@@ -213,16 +241,15 @@ func TestList(t *testing.T) {
 	})
 
 	t.Run("should shut down every resource and return the first error when a Shutdown fails", func(t *testing.T) {
-		c := resource.NewList()
 		errFirst := errors.New("first is stuck")
 		errLast := errors.New("last is stuck")
 		first := fixture.NewHealthyFakeManaged("first").FailShutdownWith(errFirst)
 		last := fixture.NewHealthyFakeManaged("last").FailShutdownWith(errLast)
-		require.NoError(t, c.Register(first))
-		require.NoError(t, c.Register(last))
+		c, err := resource.NewList(first, last)
+		require.NoError(t, err)
 		require.NoError(t, c.Init(ctx))
 
-		err := c.Shutdown(ctx)
+		err = c.Shutdown(ctx)
 
 		// Resources shut down in reverse order, so the last one fails first.
 		require.ErrorIs(t, err, errLast)
@@ -232,13 +259,14 @@ func TestList(t *testing.T) {
 	})
 
 	t.Run("should report health and per-resource statuses", func(t *testing.T) {
-		c := resource.NewList()
-		assert.True(t, c.IsHealthy(), "empty list should be healthy")
+		empty, err := resource.NewList()
+		require.NoError(t, err)
+		assert.True(t, empty.IsHealthy(), "empty list should be healthy")
 
 		a := fixture.NewHealthyFakeManaged("a")
 		b := fixture.NewHealthyFakeManaged("b")
-		require.NoError(t, c.Register(a))
-		require.NoError(t, c.Register(b))
+		c, err := resource.NewList(a, b)
+		require.NoError(t, err)
 		require.NoError(t, c.Init(ctx))
 		assert.True(t, c.IsHealthy(), "all healthy should be healthy")
 
@@ -257,9 +285,9 @@ func TestList(t *testing.T) {
 	})
 
 	t.Run("should expose one resource's status through StatusOf", func(t *testing.T) {
-		c := resource.NewList()
 		r := fixture.NewHealthyFakeManaged("nats")
-		require.NoError(t, c.Register(r))
+		c, err := resource.NewList(r)
+		require.NoError(t, err)
 		require.NoError(t, c.Init(ctx))
 
 		obs, ok := c.StatusOf("nats")
@@ -277,7 +305,8 @@ func TestList(t *testing.T) {
 	})
 
 	t.Run("should aggregate the resources' statuses into its own observable status", func(t *testing.T) {
-		c := resource.NewList()
+		c, err := resource.NewList()
+		require.NoError(t, err)
 		assert.Equal(t, resource.StatusInitializing, c.Status().Get(), "empty list should be INITIALIZING")
 
 		a := fixture.NewHealthyFakeManaged("a")
@@ -315,12 +344,12 @@ func TestList(t *testing.T) {
 	})
 
 	t.Run("should nest inside another List as a composite resource", func(t *testing.T) {
-		inner := resource.NewList()
 		r := fixture.NewHealthyFakeManaged("db")
-		require.NoError(t, inner.Register(r))
+		inner, err := resource.NewList(r)
+		require.NoError(t, err)
 
-		outer := resource.NewList()
-		require.NoError(t, outer.Register(inner))
+		outer, err := resource.NewList(inner)
+		require.NoError(t, err)
 		require.NoError(t, outer.Init(ctx))
 		assert.Equal(t, resource.StatusHealthy, outer.Status().Get())
 

@@ -42,9 +42,8 @@ func TestHealthHandler(t *testing.T) {
 	ctx := context.Background()
 
 	t.Run("should respond 200 with every resource status when all resources are operational", func(t *testing.T) {
-		c := resource.NewList()
-		require.NoError(t, c.Register(fixture.NewHealthyFakeManaged("db")))
-		require.NoError(t, c.Register(fixture.NewHealthyFakeManaged("nats")))
+		c, err := resource.NewList(fixture.NewHealthyFakeManaged("db"), fixture.NewHealthyFakeManaged("nats"))
+		require.NoError(t, err)
 		require.NoError(t, c.Init(ctx))
 
 		code, response := serveHealth(t, c)
@@ -55,9 +54,9 @@ func TestHealthHandler(t *testing.T) {
 	})
 
 	t.Run("should respond 503 when a resource is not operational", func(t *testing.T) {
-		c := resource.NewList()
 		db := fixture.NewHealthyFakeManaged("db")
-		require.NoError(t, c.Register(db))
+		c, err := resource.NewList(db)
+		require.NoError(t, err)
 		require.NoError(t, c.Init(ctx))
 		db.Notify(resource.StatusUnhealthy)
 
@@ -69,7 +68,8 @@ func TestHealthHandler(t *testing.T) {
 	})
 
 	t.Run("should respond 200 for a list with no resources", func(t *testing.T) {
-		c := resource.NewList()
+		c, err := resource.NewList()
+		require.NoError(t, err)
 
 		code, response := serveHealth(t, c)
 
@@ -79,8 +79,8 @@ func TestHealthHandler(t *testing.T) {
 	})
 
 	t.Run("should serve the health on GET /health once registered", func(t *testing.T) {
-		c := resource.NewList()
-		require.NoError(t, c.Register(fixture.NewHealthyFakeManaged("db")))
+		c, err := resource.NewList(fixture.NewHealthyFakeManaged("db"))
+		require.NoError(t, err)
 		require.NoError(t, c.Init(ctx))
 		router := mux.NewRouter()
 		require.NoError(t, httpserver.NewHealthHandler(c).Register(router))
@@ -93,7 +93,9 @@ func TestHealthHandler(t *testing.T) {
 
 	t.Run("should serve the health on the path set with WithPath", func(t *testing.T) {
 		router := mux.NewRouter()
-		require.NoError(t, httpserver.NewHealthHandler(resource.NewList()).WithPath("/healthz").Register(router))
+		resources, err := resource.NewList()
+		require.NoError(t, err)
+		require.NoError(t, httpserver.NewHealthHandler(resources).WithPath("/healthz").Register(router))
 
 		rec := httptest.NewRecorder()
 		router.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/healthz", nil))
@@ -106,7 +108,9 @@ func TestHealthHandler(t *testing.T) {
 
 	t.Run("should only accept GET requests", func(t *testing.T) {
 		router := mux.NewRouter()
-		require.NoError(t, httpserver.NewHealthHandler(resource.NewList()).Register(router))
+		resources, err := resource.NewList()
+		require.NoError(t, err)
+		require.NoError(t, httpserver.NewHealthHandler(resources).Register(router))
 
 		rec := httptest.NewRecorder()
 		router.ServeHTTP(rec, httptest.NewRequest(http.MethodPut, "/health", nil))

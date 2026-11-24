@@ -499,8 +499,8 @@ func TestServer(t *testing.T) {
 	t.Run("should be manageable by a resource.List", func(t *testing.T) {
 		server := udp.NewServer(newPlainConfig(), fixture.NewRecordingHandler())
 
-		list := resource.NewList()
-		require.NoError(t, list.Register(server))
+		list, err := resource.NewList(server)
+		require.NoError(t, err)
 		require.NoError(t, list.Init(ctx))
 		assert.Equal(t, resource.StatusHealthy, list.Status().Get())
 

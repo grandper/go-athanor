@@ -31,9 +31,11 @@ func TestHealthHandler(t *testing.T) {
 	ctx := context.Background()
 
 	t.Run("should reply OK with every resource status when all resources are operational", func(t *testing.T) {
-		resources := resource.NewList()
-		require.NoError(t, resources.Register(resourcefixture.NewHealthyFakeManaged("db")))
-		require.NoError(t, resources.Register(resourcefixture.NewHealthyFakeManaged("cache")))
+		resources, err := resource.NewList(
+			resourcefixture.NewHealthyFakeManaged("db"),
+			resourcefixture.NewHealthyFakeManaged("cache"),
+		)
+		require.NoError(t, err)
 		require.NoError(t, resources.Init(ctx))
 
 		reply := requestHealth(t, natsserver.NewHealthHandler(resources), "health")
@@ -44,9 +46,9 @@ func TestHealthHandler(t *testing.T) {
 	})
 
 	t.Run("should reply Service Unavailable when a resource is not operational", func(t *testing.T) {
-		resources := resource.NewList()
 		db := resourcefixture.NewHealthyFakeManaged("db")
-		require.NoError(t, resources.Register(db))
+		resources, err := resource.NewList(db)
+		require.NoError(t, err)
 		require.NoError(t, resources.Init(ctx))
 		db.Notify(resource.StatusUnhealthy)
 
@@ -57,14 +59,18 @@ func TestHealthHandler(t *testing.T) {
 	})
 
 	t.Run("should reply OK for a list with no resources", func(t *testing.T) {
-		reply := requestHealth(t, natsserver.NewHealthHandler(resource.NewList()), "health")
+		resources, err := resource.NewList()
+		require.NoError(t, err)
+		reply := requestHealth(t, natsserver.NewHealthHandler(resources), "health")
 
 		assert.Equal(t, "OK", reply.Header.Get("Status"))
 		assert.JSONEq(t, `{"status":true,"resources":{}}`, string(reply.Data))
 	})
 
 	t.Run("should serve the health on the subject set with WithSubject", func(t *testing.T) {
-		handler := natsserver.NewHealthHandler(resource.NewList()).WithSubject("my-service.health")
+		resources, err := resource.NewList()
+		require.NoError(t, err)
+		handler := natsserver.NewHealthHandler(resources).WithSubject("my-service.health")
 
 		reply := requestHealth(t, handler, "my-service.health")
 
@@ -74,7 +80,9 @@ func TestHealthHandler(t *testing.T) {
 	t.Run("fails to register when the subject is empty", func(t *testing.T) {
 		server := natsserver.NewServer(fixture.ConnectToEmbeddedServer(t))
 
-		err := natsserver.NewHealthHandler(resource.NewList()).WithSubject("").Register(server)
+		resources, err := resource.NewList()
+		require.NoError(t, err)
+		err = natsserver.NewHealthHandler(resources).WithSubject("").Register(server)
 
 		assert.ErrorIs(t, err, natsserver.ErrEmptySubject)
 	})
@@ -82,7 +90,9 @@ func TestHealthHandler(t *testing.T) {
 	t.Run("fails when the request has no reply subject", func(t *testing.T) {
 		nc := fixture.ConnectToEmbeddedServer(t)
 		recorder := fixture.NewHookRecorder()
-		server := natsserver.NewServer(nc, natsserver.NewHealthHandler(resource.NewList())).
+		resources, err := resource.NewList()
+		require.NoError(t, err)
+		server := natsserver.NewServer(nc, natsserver.NewHealthHandler(resources)).
 			WithHooks(recorder.HandlerFailedHook())
 		require.NoError(t, server.Init(ctx))
 

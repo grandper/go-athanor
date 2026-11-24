@@ -23,7 +23,9 @@ func TestNewHealthClient(t *testing.T) {
 
 	t.Run("should return a client of the health service served on the address", func(t *testing.T) {
 		listener := athanorfixture.ListenOnFreePort(t)
-		server := grpcserver.NewServer(&grpcserver.Config{}, grpcserver.NewHealthHandler(resource.NewList())).
+		resources, err := resource.NewList()
+		require.NoError(t, err)
+		server := grpcserver.NewServer(&grpcserver.Config{}, grpcserver.NewHealthHandler(resources)).
 			WithListener(listener)
 		require.NoError(t, server.Init(ctx))
 		defer func() { require.NoError(t, server.Shutdown(ctx)) }()
@@ -43,7 +45,9 @@ func TestAssertEventuallyServing(t *testing.T) {
 
 	t.Run("should accept a service reported as serving", func(t *testing.T) {
 		listener := athanorfixture.ListenOnFreePort(t)
-		server := grpcserver.NewServer(&grpcserver.Config{}, grpcserver.NewHealthHandler(resource.NewList())).
+		resources, err := resource.NewList()
+		require.NoError(t, err)
+		server := grpcserver.NewServer(&grpcserver.Config{}, grpcserver.NewHealthHandler(resources)).
 			WithListener(listener)
 		require.NoError(t, server.Init(ctx))
 		defer func() { require.NoError(t, server.Shutdown(ctx)) }()

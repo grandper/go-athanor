@@ -43,14 +43,14 @@ func TestServer(t *testing.T) {
 	})
 
 	t.Run("should return the same server from WithHooks", func(t *testing.T) {
-		server := newHealthServer()
+		server := newHealthServer(t)
 
 		assert.Same(t, server, server.WithHooks(fixture.NewHookRecorder().Hooks()...))
 	})
 
 	t.Run("should keep the hooks of every WithHooks call", func(t *testing.T) {
 		first, second := fixture.NewHookRecorder(), fixture.NewHookRecorder()
-		server := newHealthServer().WithHooks(first.Hooks()...)
+		server := newHealthServer(t).WithHooks(first.Hooks()...)
 		server.WithHooks(second.Hooks()...)
 		client := serveOnFreePort(t, server)
 
@@ -64,7 +64,7 @@ func TestServer(t *testing.T) {
 
 	t.Run("should ignore the hooks added after Init", func(t *testing.T) {
 		early, late := fixture.NewHookRecorder(), fixture.NewHookRecorder()
-		server := newHealthServer().WithHooks(early.Hooks()...)
+		server := newHealthServer(t).WithHooks(early.Hooks()...)
 		client := serveOnFreePort(t, server)
 
 		server.WithHooks(late.Hooks()...)
@@ -78,7 +78,7 @@ func TestServer(t *testing.T) {
 
 	t.Run("should let hooks be added while requests are served", func(t *testing.T) {
 		const requestCount = 20
-		server := newHealthServer().WithHooks(fixture.NewHookRecorder().Hooks()...)
+		server := newHealthServer(t).WithHooks(fixture.NewHookRecorder().Hooks()...)
 		client := serveOnFreePort(t, server)
 
 		// The race detector fails the test when the requests read the hooks without synchronization.
@@ -159,10 +159,12 @@ func TestServer(t *testing.T) {
 
 	t.Run("should serve on the listener set with WithListener instead of the listen address", func(t *testing.T) {
 		listener := athanorfixture.ListenOnFreePort(t)
-		server := grpcserver.NewServer(&grpcserver.Config{}, grpcserver.NewHealthHandler(resource.NewList())).
+		resources, err := resource.NewList()
+		require.NoError(t, err)
+		server := grpcserver.NewServer(&grpcserver.Config{}, grpcserver.NewHealthHandler(resources)).
 			WithListener(listener)
 
-		err := server.Init(ctx)
+		err = server.Init(ctx)
 
 		require.NoError(t, err)
 		defer func() { require.NoError(t, server.Shutdown(ctx)) }()
@@ -248,7 +250,9 @@ func TestServer(t *testing.T) {
 
 	t.Run("should stop immediately when the context expires before the in-flight calls complete", func(t *testing.T) {
 		listener := athanorfixture.ListenOnFreePort(t)
-		server := grpcserver.NewServer(&grpcserver.Config{}, grpcserver.NewHealthHandler(resource.NewList())).
+		resources, err := resource.NewList()
+		require.NoError(t, err)
+		server := grpcserver.NewServer(&grpcserver.Config{}, grpcserver.NewHealthHandler(resources)).
 			WithListener(listener)
 		require.NoError(t, server.Init(ctx))
 
@@ -284,8 +288,8 @@ func TestServer(t *testing.T) {
 	t.Run("should be manageable by a resource.List", func(t *testing.T) {
 		server := grpcserver.NewServer(&grpcserver.Config{}).WithListener(athanorfixture.ListenOnFreePort(t))
 
-		list := resource.NewList()
-		require.NoError(t, list.Register(server))
+		list, err := resource.NewList(server)
+		require.NoError(t, err)
 		require.NoError(t, list.Init(ctx))
 		assert.Equal(t, resource.StatusHealthy, list.Status().Get())
 

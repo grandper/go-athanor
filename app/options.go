@@ -44,7 +44,12 @@ func WithResource(r resource.Managed) Option {
 func WithResources(resources ...resource.Managed) Option {
 	return func(a *App) error {
 		if a.resources == nil {
-			a.resources = resource.NewList()
+			list, err := resource.NewList(resources...)
+			if err != nil {
+				return fmt.Errorf("failed to register a resource: %w", err)
+			}
+			a.resources = list
+			return nil
 		}
 		for _, r := range resources {
 			if err := a.resources.Register(r); err != nil {

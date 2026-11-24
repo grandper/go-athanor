@@ -331,8 +331,8 @@ func TestServer(t *testing.T) {
 		server := natsserver.NewServer(fixture.ConnectToEmbeddedServer(t))
 		require.NoError(t, server.HandleFunc("orders.created", "", fixture.NewFakeHandlerFunc().Handle))
 
-		list := resource.NewList()
-		require.NoError(t, list.Register(server))
+		list, err := resource.NewList(server)
+		require.NoError(t, err)
 		require.NoError(t, list.Init(ctx))
 		assert.Equal(t, resource.StatusHealthy, list.Status().Get())
 

@@ -320,9 +320,12 @@ func TestRun(t *testing.T) {
 		port, result := athanorfixture.RunOnFreePort(t, func(port int) error {
 			config := &httpserver.Config{BindInterface: "127.0.0.1", BindPort: port}
 			// The HealthHandler reports on the List holding its own server, which runs as one composite resource.
-			resources := resource.NewList()
+			resources, err := resource.NewList()
+			if err != nil {
+				return err
+			}
 			server := httpserver.NewServer(config, httpserver.NewHealthHandler(resources))
-			if err := resources.Register(server); err != nil {
+			if err = resources.Register(server); err != nil {
 				return err
 			}
 			return app.Run(cancelCtx, app.WithResource(resources))
@@ -365,7 +368,8 @@ func TestRun(t *testing.T) {
 	t.Run("should serve the registered gRPC handlers", func(t *testing.T) {
 		listener := athanorfixture.ListenOnFreePort(t)
 		// The HealthHandler reports on the List holding its own server, which runs as one composite resource.
-		resources := resource.NewList()
+		resources, err := resource.NewList()
+		require.NoError(t, err)
 		server := grpcserver.NewServer(&grpcserver.Config{}, grpcserver.NewHealthHandler(resources)).
 			WithListener(listener)
 		require.NoError(t, resources.Register(server))
@@ -378,7 +382,7 @@ func TestRun(t *testing.T) {
 		grpcfixture.AssertEventuallyServing(t, grpcfixture.NewHealthClient(t, listener.Addr().String()), "")
 
 		cancel()
-		err := athanorfixture.Receive(t, result, 5*time.Second, "Run did not return after the context was canceled")
+		err = athanorfixture.Receive(t, result, 5*time.Second, "Run did not return after the context was canceled")
 		require.NoError(t, err)
 	})
 }

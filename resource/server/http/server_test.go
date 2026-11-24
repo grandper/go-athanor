@@ -273,8 +273,8 @@ func TestServer(t *testing.T) {
 		config := &httpserver.Config{BindInterface: "127.0.0.1"}
 		server := httpserver.NewServer(config)
 
-		list := resource.NewList()
-		require.NoError(t, list.Register(server))
+		list, err := resource.NewList(server)
+		require.NoError(t, err)
 		require.NoError(t, fixture.InitOnFreePort(ctx, t, config, list.Init))
 		assert.Equal(t, resource.StatusHealthy, list.Status().Get())
 

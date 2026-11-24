@@ -35,8 +35,11 @@ func serveOnFreePort(t *testing.T, server *grpcserver.Server) grpc_health_v1.Hea
 
 // newHealthServer returns a server of the health service of an empty resource list, for which every named service
 // is unknown.
-func newHealthServer() *grpcserver.Server {
-	return grpcserver.NewServer(&grpcserver.Config{}, grpcserver.NewHealthHandler(resource.NewList()))
+func newHealthServer(t *testing.T) *grpcserver.Server {
+	t.Helper()
+	resources, err := resource.NewList()
+	require.NoError(t, err)
+	return grpcserver.NewServer(&grpcserver.Config{}, grpcserver.NewHealthHandler(resources))
 }
 
 func TestOnHandlerFailed(t *testing.T) {
@@ -44,7 +47,7 @@ func TestOnHandlerFailed(t *testing.T) {
 
 	t.Run("should receive the method and the error of a unary request that fails", func(t *testing.T) {
 		recorder := fixture.NewHookRecorder()
-		client := serveOnFreePort(t, newHealthServer().WithHooks(recorder.HandlerFailedHook()))
+		client := serveOnFreePort(t, newHealthServer(t).WithHooks(recorder.HandlerFailedHook()))
 
 		_, err := checkHealth(t, client, "orders")
 
@@ -60,7 +63,7 @@ func TestOnHandlerFailed(t *testing.T) {
 
 	t.Run("should receive the method and the error of a stream request that fails", func(t *testing.T) {
 		recorder := fixture.NewHookRecorder()
-		client := serveOnFreePort(t, newHealthServer().WithHooks(recorder.HandlerFailedHook()))
+		client := serveOnFreePort(t, newHealthServer(t).WithHooks(recorder.HandlerFailedHook()))
 		watchCtx, cancel := context.WithCancel(ctx)
 		defer cancel()
 		stream, err := client.Watch(watchCtx, &grpc_health_v1.HealthCheckRequest{})
@@ -77,7 +80,7 @@ func TestOnHandlerFailed(t *testing.T) {
 
 	t.Run("should not fire for a request that succeeds", func(t *testing.T) {
 		recorder := fixture.NewHookRecorder()
-		client := serveOnFreePort(t, newHealthServer().WithHooks(recorder.Hooks()...))
+		client := serveOnFreePort(t, newHealthServer(t).WithHooks(recorder.Hooks()...))
 
 		response, err := checkHealth(t, client, "")
 
@@ -88,7 +91,7 @@ func TestOnHandlerFailed(t *testing.T) {
 
 	t.Run("should run every hook, in registration order, across several WithHooks calls", func(t *testing.T) {
 		recorder := fixture.NewHookRecorder()
-		server := newHealthServer().
+		server := newHealthServer(t).
 			WithHooks(recorder.HooksLabeled("first")...).
 			WithHooks(append(recorder.HooksLabeled("second"), recorder.HooksLabeled("third")...)...)
 		client := serveOnFreePort(t, server)
@@ -105,7 +108,7 @@ func TestOnHandlerFailed(t *testing.T) {
 
 	t.Run("should ignore a nil callback and still run the other hooks", func(t *testing.T) {
 		recorder := fixture.NewHookRecorder()
-		server := newHealthServer().
+		server := newHealthServer(t).
 			WithHooks(grpcserver.OnHandlerFailed(nil), grpcserver.OnHandlerPanicked(nil)).
 			WithHooks(recorder.Hooks()...).
 			WithHooks(grpcserver.OnHandlerFailed(nil))
@@ -239,7 +242,7 @@ func serveForConnection(t *testing.T, server *grpcserver.Server) *fixture.Health
 func TestOnConnectionEstablished(t *testing.T) {
 	t.Run("should fire with the remote address of the client once its connection is established", func(t *testing.T) {
 		recorder := fixture.NewHookRecorder()
-		connection := serveForConnection(t, newHealthServer().WithHooks(recorder.ConnectionEstablishedHook()))
+		connection := serveForConnection(t, newHealthServer(t).WithHooks(recorder.ConnectionEstablishedHook()))
 
 		_, err := checkHealth(t, connection.Client(), "")
 
@@ -250,7 +253,7 @@ func TestOnConnectionEstablished(t *testing.T) {
 
 	t.Run("should not fire before a client connects", func(t *testing.T) {
 		recorder := fixture.NewHookRecorder()
-		serveForConnection(t, newHealthServer().WithHooks(recorder.ConnectionEstablishedHook()))
+		serveForConnection(t, newHealthServer(t).WithHooks(recorder.ConnectionEstablishedHook()))
 
 		assert.Never(t, func() bool { return len(recorder.Events()) > 0 }, 100*time.Millisecond, 5*time.Millisecond)
 	})
@@ -262,7 +265,7 @@ func TestOnConnectionClosed(t *testing.T) {
 	t.Run("should fire with the remote address of the client when the client closes its connection",
 		func(t *testing.T) {
 			recorder := fixture.NewHookRecorder()
-			connection := serveForConnection(t, newHealthServer().
+			connection := serveForConnection(t, newHealthServer(t).
 				WithHooks(recorder.ConnectionEstablishedHook(), recorder.ConnectionClosedHook()))
 			_, err := checkHealth(t, connection.Client(), "")
 			require.NoError(t, err)
@@ -276,7 +279,7 @@ func TestOnConnectionClosed(t *testing.T) {
 
 	t.Run("should fire for the connections Shutdown closes", func(t *testing.T) {
 		recorder := fixture.NewHookRecorder()
-		server := newHealthServer().WithHooks(recorder.ConnectionClosedHook())
+		server := newHealthServer(t).WithHooks(recorder.ConnectionClosedHook())
 		connection := serveForConnection(t, server)
 		_, err := checkHealth(t, connection.Client(), "")
 		require.NoError(t, err)
@@ -290,7 +293,7 @@ func TestOnConnectionClosed(t *testing.T) {
 
 	t.Run("should run every connection hook in registration order and ignore a nil callback", func(t *testing.T) {
 		recorder := fixture.NewHookRecorder()
-		server := newHealthServer().
+		server := newHealthServer(t).
 			WithHooks(grpcserver.OnConnectionEstablished(nil), grpcserver.OnConnectionClosed(nil)).
 			WithHooks(recorder.HooksLabeled("first")...).
 			WithHooks(append([]grpcserver.Hook{grpcserver.OnConnectionClosed(nil)},
@@ -313,7 +316,7 @@ func TestOnConnectionClosed(t *testing.T) {
 func TestOnRequestStatsReported(t *testing.T) {
 	t.Run("should report a request beginning first and ending last", func(t *testing.T) {
 		recorder := fixture.NewHookRecorder()
-		client := serveOnFreePort(t, newHealthServer().WithHooks(recorder.RequestStatsReportedHook()))
+		client := serveOnFreePort(t, newHealthServer(t).WithHooks(recorder.RequestStatsReportedHook()))
 
 		_, err := checkHealth(t, client, "")
 
@@ -336,7 +339,7 @@ func TestOnRequestStatsReported(t *testing.T) {
 
 	t.Run("should report the end of a failed request with its error", func(t *testing.T) {
 		recorder := fixture.NewHookRecorder()
-		client := serveOnFreePort(t, newHealthServer().WithHooks(recorder.RequestStatsReportedHook()))
+		client := serveOnFreePort(t, newHealthServer(t).WithHooks(recorder.RequestStatsReportedHook()))
 
 		_, err := checkHealth(t, client, "orders")
 
@@ -350,7 +353,7 @@ func TestOnRequestStatsReported(t *testing.T) {
 
 	t.Run("should run every hook in registration order and ignore a nil callback", func(t *testing.T) {
 		recorder := fixture.NewHookRecorder()
-		server := newHealthServer().
+		server := newHealthServer(t).
 			WithHooks(grpcserver.OnRequestStatsReported(nil)).
 			WithHooks(recorder.HooksLabeled("first")...).
 			WithHooks(append([]grpcserver.Hook{grpcserver.OnRequestStatsReported(nil)},
